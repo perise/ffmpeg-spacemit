@@ -112,7 +112,7 @@ conversion so standard pixel formats work without an extra `scale` step.
 
 ## Reference
 
-- [ffmpeg-rockchip](https://github.com/nyanmisaka/ffmpeg-rockchip) \xe2\x80\x94 structural reference
-- [SpacemiT K1 TRM](https://developer.spacemit.com) \xe2\x80\x94 K1 hardware documentation
-- [Bianbu OS](https://bianbu.spacemit.com) \xe2\x80\x94 official K1 Linux distribution
+- [ffmpeg-rockchip](https://github.com/nyanmisaka/ffmpeg-rockchip)   structural reference
+- [SpacemiT K1 TRM](https://developer.spacemit.com)   hardware documentation
+- [Bianbu OS](https://bianbu.spacemit.com)   official K1 Linux distribution
 - [V4L2 stateful codec API](https://www.kernel.org/doc/html/latest/userspace-api/media/v4l/dev-decoder.html)
