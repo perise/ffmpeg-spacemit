@@ -8,7 +8,7 @@ FFmpeg fork adding hardware-accelerated encoding and decoding for the
 
 The SpacemiT K1 exposes its MVX/Linlon video IP through the standard
 Linux **V4L2 Stateful M2M** interface (`V4L2_CAP_VIDEO_M2M_MPLANE`).
-No proprietary userspace library is required \xe2\x80\x94 the codec talks directly
+No proprietary userspace library is required the codec talks directly
 to the kernel driver via standard POSIX V4L2 ioctls.
 
 This makes the diff minimal and easy to rebase against future FFmpeg
@@ -26,7 +26,7 @@ releases, keeping the project in sync with mainline.
 ## Prerequisites
 
 - SpacemiT K1 board (BPI-F3, Milk-V Jupiter, etc.) running Bianbu OS or
-  any Linux with kernel \xe2\x89\xa5 6.1 and the `mvx` / `linlon` V4L2 driver loaded
+  any Linux with kernel 6.1 and the `mvx` / `linlon` V4L2 driver loaded
 - FFmpeg build dependencies: `build-essential nasm pkg-config`
 
 ## Building
