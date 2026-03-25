@@ -102,12 +102,12 @@ git push --force-with-lease origin master
 
 ## Why not use the existing `h264_v4l2m2m` encoder?
 
-FFmpeg\xe2\x80\x99s built-in V4L2 M2M code defaults to single-planar buffer types.
+FFmpeg built-in V4L2 M2M code defaults to single-planar buffer types.
 The SpacemiT K1 MVX driver requires `_MPLANE` types for **all** ioctls
 and only reports `V4L2_CAP_VIDEO_M2M_MPLANE`. `spacemitmppenc` /
 `spacemitmppdec` always use `V4L2_BUF_TYPE_VIDEO_*_MPLANE` and call
 `VIDIOC_G_FMT` after `VIDIOC_S_FMT` to read back the actual `num_planes`
-assigned by the driver. The encoder also handles inline YUV420P\xe2\x86\x92NV12
+assigned by the driver. The encoder also handles inline YUV420P, NV12
 conversion so standard pixel formats work without an extra `scale` step.
 
 ## Reference
