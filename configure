@@ -3606,18 +3606,20 @@ h264_v4l2m2m_decoder_select="h264_mp4toannexb_bsf"
 h264_v4l2m2m_encoder_deps="v4l2_m2m h264_v4l2_m2m"
 
 # SpacemiT K1 MPP (V4L2 M2M MPLANE — no external library required)
-spacemit_mpp_encoder_deps="linux_videodev2_h"
-spacemit_mpp_decoder_deps="linux_videodev2_h"
+# --enable-spacemit_mpp enables the feature and auto-selects all supported codecs.
+# Individual codecs can still be disabled with --disable-encoder=h264_spacemit_mpp etc.
+spacemit_mpp_deps="linux_videodev2_h"
+spacemit_mpp_select="h264_spacemit_mpp_encoder hevc_spacemit_mpp_encoder vp8_spacemit_mpp_encoder vp9_spacemit_mpp_encoder h264_spacemit_mpp_decoder hevc_spacemit_mpp_decoder vp8_spacemit_mpp_decoder vp9_spacemit_mpp_decoder"
 
-h264_spacemit_mpp_encoder_deps="spacemit_mpp_encoder"
-hevc_spacemit_mpp_encoder_deps="spacemit_mpp_encoder"
-vp8_spacemit_mpp_encoder_deps="spacemit_mpp_encoder"
-vp9_spacemit_mpp_encoder_deps="spacemit_mpp_encoder"
+h264_spacemit_mpp_encoder_deps="linux_videodev2_h"
+hevc_spacemit_mpp_encoder_deps="linux_videodev2_h"
+vp8_spacemit_mpp_encoder_deps="linux_videodev2_h"
+vp9_spacemit_mpp_encoder_deps="linux_videodev2_h"
 
-h264_spacemit_mpp_decoder_deps="spacemit_mpp_decoder"
-hevc_spacemit_mpp_decoder_deps="spacemit_mpp_decoder"
-vp8_spacemit_mpp_decoder_deps="spacemit_mpp_decoder"
-vp9_spacemit_mpp_decoder_deps="spacemit_mpp_decoder"
+h264_spacemit_mpp_decoder_deps="linux_videodev2_h"
+hevc_spacemit_mpp_decoder_deps="linux_videodev2_h"
+vp8_spacemit_mpp_decoder_deps="linux_videodev2_h"
+vp9_spacemit_mpp_decoder_deps="linux_videodev2_h"
 hevc_amf_encoder_deps="amf"
 hevc_amf_decoder_deps="amf"
 hevc_cuvid_decoder_deps="cuvid"
