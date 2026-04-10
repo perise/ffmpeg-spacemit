@@ -839,8 +839,8 @@ static int init_slice_fn(AVFilterContext *ctx)
     ff_overlay_init_x86(ctx);
 #endif
 #if ARCH_RISCV
-    ff_overlay_init_riscv(s, s->format, inlink->format,
-                           s->alpha_format, s->main_has_alpha);
+    ff_overlay_init_riscv(s, s->format, main->format,
+                           !overlay_straight, s->main_has_alpha);
 #endif
 
     return 0;

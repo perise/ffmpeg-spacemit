@@ -7,6 +7,7 @@
  */
 
 #include "config.h"
+#include <stddef.h>
 #include "libavutil/attributes.h"
 #include "libavutil/riscv/cpu.h"
 #include "libavfilter/vf_nlmeans.h"
@@ -25,8 +26,8 @@ void ff_compute_weights_line_rvv(const uint32_t *const iia,
                                   float *total_weight,
                                   float *sum,
                                   const float *const weight_lut,
-                                  int max_meaningful_diff,
-                                  int startx, int endx);
+                                  ptrdiff_t max_meaningful_diff,
+                                  ptrdiff_t startx, ptrdiff_t endx);
 
 av_cold void ff_nlmeans_init_riscv(NLMeansDSPContext *dsp)
 {

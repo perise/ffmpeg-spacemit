@@ -72,11 +72,20 @@ RVV_INPUT(bgra32);
 RVV_INPUT(rgb24);
 RVV_INPUT(rgba32);
 
+/* NV12/NV21 UV deinterleave - implemented in input_rvv.S */
+void ff_nv12ToUV_rvv(uint8_t *dstU, uint8_t *dstV,
+                     const uint8_t *unused0, const uint8_t *src,
+                     const uint8_t *unused2, int width,
+                     uint32_t *pal, void *opq);
+void ff_nv21ToUV_rvv(uint8_t *dstU, uint8_t *dstV,
+                     const uint8_t *unused0, const uint8_t *src,
+                     const uint8_t *unused2, int width,
+                     uint32_t *pal, void *opq);
 
 /* RVV fast bilinear hscale - implemented in hyscale_fast_rvv.S */
-void ff_hyscale_fast_rvv(struct SwsContext *c, int16_t *dst, int dstWidth,
+void ff_hyscale_fast_rvv(SwsInternal *c, int16_t *dst, int dstWidth,
                           const uint8_t *src, int srcW, int xInc);
-void ff_hcscale_fast_rvv(struct SwsContext *c, int16_t *dst1, int16_t *dst2,
+void ff_hcscale_fast_rvv(SwsInternal *c, int16_t *dst1, int16_t *dst2,
                           int dstWidth, const uint8_t *src1,
                           const uint8_t *src2, int srcW, int xInc);
 
@@ -88,7 +97,7 @@ void ff_yuv2planeX_8_rvv(const int16_t *filter, int filterSize,
                           const uint8_t *dither, int offset);
 
 /* RVV full bilinear/bicubic horizontal scaler - implemented in hscale_rvv.S */
-void ff_hscale8to15_rvv(struct SwsContext *c, int16_t *dst, int dstW,
+void ff_hscale8to15_rvv(SwsInternal *c, int16_t *dst, int dstW,
                          const uint8_t *src, const int16_t *filter,
                          const int32_t *filterPos, int filterSize);
 
