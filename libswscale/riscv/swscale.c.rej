@@ -1,0 +1,13 @@
+diff a/libswscale/riscv/swscale.c b/libswscale/riscv/swscale.c	(rejected hunks)
+@@ -91,6 +91,11 @@ void ff_hcscale_fast_rvv(struct SwsContext *c, int16_t *dst1, int16_t *dst2,
+                           int dstWidth, const uint8_t *src1,
+                           const uint8_t *src2, int srcW, int xInc);
+ 
++
++/* RVV full bilinear/bicubic horizontal scaler - implemented in hscale_rvv.S */
++void ff_hscale8to15_rvv(struct SwsContext *c, int16_t *dst, int dstW,
++                         const uint8_t *src, const int16_t *filter,
++                         const int32_t *filterPos, int filterSize);
+ av_cold void ff_sws_init_swscale_riscv(SwsContext *c)
+ {
+     int flags = av_get_cpu_flags();

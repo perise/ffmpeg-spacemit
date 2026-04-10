@@ -6,4 +6,6 @@ OBJS +=     riscv/float_dsp_init.o \
 RVV-OBJS += riscv/float_dsp_rvv.o \
             riscv/fixed_dsp_rvv.o \
             riscv/lls_rvv.o
+
+RVV-OBJS += riscv/imgutils_rvv.o
 RVV-OBJS-$(CONFIG_PIXELUTILS) += riscv/pixelutils_rvv.o

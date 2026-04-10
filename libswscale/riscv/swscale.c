@@ -19,6 +19,7 @@
 #include "config.h"
 #include "libavutil/attributes.h"
 #include "libavutil/riscv/cpu.h"
+#include "libswscale/swscale.h"
 #include "libswscale/swscale_internal.h"
 
 void ff_range_lum_to_jpeg_16_rvv(int16_t *, int);
@@ -71,6 +72,26 @@ RVV_INPUT(bgra32);
 RVV_INPUT(rgb24);
 RVV_INPUT(rgba32);
 
+
+/* RVV fast bilinear hscale - implemented in hyscale_fast_rvv.S */
+void ff_hyscale_fast_rvv(struct SwsContext *c, int16_t *dst, int dstWidth,
+                          const uint8_t *src, int srcW, int xInc);
+void ff_hcscale_fast_rvv(struct SwsContext *c, int16_t *dst1, int16_t *dst2,
+                          int dstWidth, const uint8_t *src1,
+                          const uint8_t *src2, int srcW, int xInc);
+
+/* RVV vertical output kernels - implemented in output_rvv.S */
+void ff_yuv2plane1_8_rvv(const int16_t *src, uint8_t *dest, int dstW,
+                          const uint8_t *dither, int offset);
+void ff_yuv2planeX_8_rvv(const int16_t *filter, int filterSize,
+                          const int16_t **src, uint8_t *dest, int dstW,
+                          const uint8_t *dither, int offset);
+
+/* RVV full bilinear/bicubic horizontal scaler - implemented in hscale_rvv.S */
+void ff_hscale8to15_rvv(struct SwsContext *c, int16_t *dst, int dstW,
+                         const uint8_t *src, const int16_t *filter,
+                         const int32_t *filterPos, int filterSize);
+
 av_cold void ff_sws_init_swscale_riscv(SwsInternal *c)
 {
 #if HAVE_RVV
@@ -118,6 +139,14 @@ av_cold void ff_sws_init_swscale_riscv(SwsInternal *c)
                     c->chrToYV12 = ff_rgb24ToUV_rvv;
                 break;
 
+            case AV_PIX_FMT_NV12:
+                c->chrToYV12 = ff_nv12ToUV_rvv;
+                break;
+
+            case AV_PIX_FMT_NV21:
+                c->chrToYV12 = ff_nv21ToUV_rvv;
+                break;
+
             case AV_PIX_FMT_RGBA:
                 c->lumToYV12 = ff_rgba32ToY_rvv;
                 if (c->chrSrcHSubSample)
@@ -126,6 +155,34 @@ av_cold void ff_sws_init_swscale_riscv(SwsInternal *c)
                     c->chrToYV12 = ff_rgba32ToUV_rvv;
                 break;
         }
+    }
+#endif
+#if HAVE_RVV
+    /* Fast bilinear horizontal scaler (SWS_FAST_BILINEAR + 8-bit src) */
+    if ((flags & AV_CPU_FLAG_RVV_I32) && (flags & AV_CPU_FLAG_RVB) &&
+        (c->opts.flags & SWS_FAST_BILINEAR) && c->srcBpc == 8) {
+        c->hyscale_fast = ff_hyscale_fast_rvv;
+        if (c->needs_hcscale)
+            c->hcscale_fast = ff_hcscale_fast_rvv;
+    }
+#endif
+#if HAVE_RVV
+    /* Vertical output kernels for 8-bit planar output */
+    if ((flags & AV_CPU_FLAG_RVV_I32) && (flags & AV_CPU_FLAG_RVB) &&
+        c->dstBpc == 8) {
+        if (c->yuv2plane1)
+            c->yuv2plane1 = (yuv2planar1_fn)ff_yuv2plane1_8_rvv;
+        if (c->yuv2planeX)
+            c->yuv2planeX = (yuv2planarX_fn)ff_yuv2planeX_8_rvv;
+    }
+#endif
+#if HAVE_RVV
+    /* Full horizontal scaler: hyScale / hcScale (8-bit src, dstBpc <= 14).
+     * Handles any filterSize (aligned to 4 as guaranteed by FFmpeg).
+     * No filterSize % 8 constraint needed thanks to VL-based RVV loop. */
+    if ((flags & AV_CPU_FLAG_RVV_I32) && (flags & AV_CPU_FLAG_RVB) &&
+        c->srcBpc == 8 && c->dstBpc <= 14) {
+        c->hyScale = c->hcScale = ff_hscale8to15_rvv;
     }
 #endif
 }

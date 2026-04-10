@@ -91,6 +91,7 @@ typedef struct YADIFContext {
 } YADIFContext;
 
 void ff_yadif_init_x86(YADIFContext *yadif);
+void ff_yadif_init_riscv(YADIFContext *yadif);
 
 int ff_yadif_filter_frame(AVFilterLink *link, AVFrame *frame);
 

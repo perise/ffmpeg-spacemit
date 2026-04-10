@@ -319,3 +319,57 @@ endfunc
 
 rgba_input rgba32, bgra32, 0
 rgba_input abgr32, argb32, 1
+
+/*
+ * NV12 / NV21 UV deinterleave using RVV vlseg2e8.v
+ *
+ * void ff_nv12ToUV_rvv(uint8_t *dstU, uint8_t *dstV,
+ *                       const uint8_t *unused0,
+ *                       const uint8_t *src,    // interleaved UV [U,V,U,V,...]
+ *                       const uint8_t *unused2,
+ *                       int width,
+ *                       uint32_t *pal, void *opq)
+ *
+ * ABI: a0=dstU, a1=dstV, a2=unused, a3=src_uv, a4=unused, a5=width
+ *
+ * vlseg2e8.v with e8,m1 (VL=32 for VLEN=256):
+ *   v2[i] = src[2*i+0]  (U bytes)
+ *   v3[i] = src[2*i+1]  (V bytes)
+ * Then store v2->dstU, v3->dstV.
+ */
+
+func ff_nv12ToUV_rvv, zve32x, zba
+        lpad    0
+1:
+        vsetvli    t0, a5, e8, m1, ta, ma   /* VL = min(width, 32) */
+        vlseg2e8.v v2, (a3)                  /* v2=U, v3=V (deinterleave) */
+        sub        a5, a5, t0                /* remaining -= VL */
+        sh1add     a3, t0, a3               /* src_uv += 2*VL (Zba: t0<<1 + a3) */
+        vse8.v     v2, (a0)                  /* store U */
+        add        a0, a0, t0               /* dstU += VL */
+        vse8.v     v3, (a1)                  /* store V */
+        add        a1, a1, t0               /* dstV += VL */
+        bnez       a5, 1b
+        ret
+endfunc
+
+/*
+ * NV21: same as NV12 but UV are swapped.
+ * src layout: [V,U,V,U,...] → dstU=V bytes (v3), dstV=U bytes (v2)
+ */
+
+func ff_nv21ToUV_rvv, zve32x, zba
+        lpad    0
+1:
+        vsetvli    t0, a5, e8, m1, ta, ma
+        vlseg2e8.v v2, (a3)                  /* v2=V, v3=U for NV21 */
+        sub        a5, a5, t0
+        sh1add     a3, t0, a3
+        vse8.v     v3, (a0)                  /* dstU ← v3 (U bytes) */
+        add        a0, a0, t0
+        vse8.v     v2, (a1)                  /* dstV ← v2 (V bytes) */
+        add        a1, a1, t0
+        bnez       a5, 1b
+        ret
+endfunc
+

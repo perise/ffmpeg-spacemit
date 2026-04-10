@@ -292,6 +292,9 @@ static int config_output(AVFilterLink *outlink)
 #if ARCH_X86 && HAVE_X86ASM
     ff_yadif_init_x86(s);
 #endif
+#if ARCH_RISCV
+    ff_yadif_init_riscv(s);
+#endif
 
     return 0;
 }
