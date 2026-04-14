@@ -91,12 +91,13 @@ func ff_yuv2plane1_8_rvv, zve32x, zba
         vsetvli zero, t0, e16, m2, ta, ma
         vzext.vf2 v4, v3                    /* dither as uint16 (e16m2) */
         vle16.v   v6, (a0)                  /* src[i..i+VL-1] (e16m2) */
-        vadd.vv   v6, v6, v4               /* src + dither */
-        vsrl.vi   v6, v6, 7               /* >> 7 → [0..255] for valid src */
+        vsadd.vv  v6, v6, v4               /* src + dither, saturating (prevent int16 wrap) */
+        vsra.vi   v6, v6, 7               /* arithmetic >> 7 → signed [−512, 511] */
+        vmax.vx   v6, v6, x0               /* saturate negative to 0 */
 
         /* Saturating narrow e16m2 → e8m1, store */
         vsetvli zero, t0, e8, m1, ta, ma
-        vnclipu.wi v0, v6, 0               /* clip and narrow to uint8 */
+        vnclipu.wi v0, v6, 0               /* clip positive overflow to 255 */
         vse8.v    v0, (a1)
 
         /* Advance pointers */
@@ -166,7 +167,7 @@ func ff_yuv2planeX_8_rvv, zve32x, zba
          * vzext.vf4 with vtype=e32m4: source is e8m1 (EMUL=m4/4=m1).
          */
         vsetvli zero, t0, e32, m4, ta, ma
-        vzext.vf4 v0, v6                    /* dither as uint32 (e32m4) */
+        vzext.vf4 v0, v6                    /* dither e8m1 -> e32m4 (zero-extend) */
         vsll.vi   v0, v0, 12               /* acc = dither << 12 */
 
         /*
