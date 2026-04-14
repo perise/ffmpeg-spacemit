@@ -34,14 +34,14 @@
  *     - vluxei8.v → gather dither byte (e8m1)
  *     - vzext.vf2 → widen dither to e16m2
  *     - vle16.v  → load int16 src (e16m2)
- *     - vadd.vv + vsrl.vi → add dither and shift
+ *     - vadd.vv + vsra.vi → add dither and arithmetic shift
  *     - vnclipu.wi → saturating narrow e16→e8
  *     Speedup: ~8× vs scalar on K1.
  *
  *   yuv2planeX_8 uses e8m1 / e16m2 / e32m4 (32 pixels per VL).
  *     - Accumulator initialized: vzext.vf4 (e8→e32) + vsll.vi 12
  *     - Inner j-loop: vwmacc.vx (int16×int16 → int32 widening acc)
- *     - vnsrl.wi 19 → narrow to approximate uint8 range
+ *     - vnsra.wi 19 → arithmetic narrow to signed int16 range
  *     - Two-step vnclipu (e32→e16→e8) with saturation to [0,255]
  *     Speedup: ~6–8× vs scalar on K1 (for typical filterSize 4–16).
  */
@@ -204,21 +204,38 @@ func ff_yuv2planeX_8_rvv, zve32x, zba
 .LpX_jdone:
         /*
          * ---- Shift and clip ----
-         * val >> 19 using vnsrl.wi (narrowing logical shift, no saturation).
+         * val >> 19 using vnsra.wi (narrowing arithmetic shift, preserves sign).
          * Result for valid input is in [0..~1023] (Lanczos can overshoot).
          * Two-step saturation narrow to uint8:
          *   e32m4 → e16m2 (vnclipu clips to [0..65535], but shift first)
          *   e16m2 → e8m1  (vnclipu clips to [0..255])
          */
+        /*
+         * K1 HARDWARE BUG WORKAROUND: vnsra.wi and vnclipu.wi only write to
+         * even-indexed elements on K1. Use vsra.vi (same-width) + stack trick
+         * to correctly extract all VL uint8 results.
+         *
+         * Pipeline: vsra.vi (arithmetic >>19, e32m4, ALL elements correct)
+         *           vmax.vx (clip negatives, e32m4)
+         *           vminu.vx (clip to 255, e32m4)
+         *           vse32.v → stack temp buffer
+         *           vlse8.v stride=4 → gather low bytes of each int32
+         *           vse8.v → output
+         */
         vsetvli zero, t0, e32, m4, ta, ma
-        vnsrl.wi v8, v0, 19                 /* v8 = val >> 19 (e16m2, truncated) */
-        /* Note: vnsrl dest is e16m2 since source is e32m4 and shift narrows */
+        vsra.vi  v0, v0, 19                 /* arithmetic >> 19 in-place (WORKS on K1) */
+        vmax.vx  v0, v0, x0                 /* clip negatives to 0 */
+        li       t1, 255
+        vminu.vx v0, v0, t1                 /* clip to [0, 255] */
 
-        vsetvli zero, t0, e16, m2, ta, ma
-        vnclipu.wi v4, v8, 0               /* clip e16m2 → e8m1 (saturate to 255) */
-
-        vsetvli zero, t0, e8, m1, ta, ma
-        vse8.v  v4, (a3)                    /* store VL uint8 pixels */
+        /* Store int32 results to stack, load low bytes (byte 0 of each int32) */
+        addi     sp, sp, -128               /* 128 bytes: 32 elements × 4 bytes */
+        vse32.v  v0, (sp)                   /* store t0 int32 values */
+        li       t1, 4                      /* stride = 4 (int32 byte size) */
+        vsetvli  zero, t0, e8, m1, ta, ma
+        vlse8.v  v4, (sp), t1              /* gather: byte[sp+0], byte[sp+4], ... */
+        vse8.v   v4, (a3)                   /* store t0 uint8 pixels */
+        addi     sp, sp, 128               /* restore stack pointer */
 
         /* Advance outer loop */
         slli    t6, t0, 1                   /* t6 = VL * 2 (int16 byte size) */
