@@ -45,10 +45,10 @@
  *   v4-v7   filterPos base values (e32m4, unchanged through inner loop)
  *   v8-v11  positions = filterPos+j (e32m4); also vluxei32.v index group
  *   v12     gathered source bytes (e8m1); EMUL_index=32/8*1=4 -> indices v8-v11
- *   v13-v14 filter coefficients int16 (e16m2)
- *   v15-v18 zero-widened source uint32 (e32m4)
- *   v19-v22 sign-widened filter int32 (e32m4)
- *   v23-v24 narrowed output int16 (e16m2)
+ *   v14-v15 filter coefficients int16 (e16m2)  [14%2=0 aligned]
+ *   v16-v19 zero-widened source uint32 (e32m4)  [16%4=0 aligned]
+ *   v20-v23 sign-widened filter int32 (e32m4)  [20%4=0 aligned]
+ *   v24-v25 narrowed output int16 (e16m2)  [24%2=0 aligned]
  *
  * Prototype:
  *   void ff_hscale8to15_rvv(SwsContext *c, int16_t *dst, int dstW,
@@ -98,28 +98,46 @@ func ff_hscale8to15_rvv, zve32x, zba
 
         /* Step 3: zero-extend gathered bytes uint8 -> uint32 */
         vsetvli zero, a7, e32, m4, ta, ma
-        vzext.vf4 v15, v12          /* v15-v18 (v15 != v12 -- no SIGILL) */
+        vzext.vf4 v16, v12          /* v16-v19 (v16%4=0, m4-aligned) */
 
         /* Step 4: strided load filter[i*filterSize+j] for i=0..vl-1 */
         /* stride = filterSize*2 bytes (consecutive i values, fixed j column) */
         vsetvli zero, a7, e16, m2, ta, ma
-        vlse16.v v13, (t2), t0      /* v13-v14 = int16 filter coefficients */
+        vlse16.v v14, (t2), t0      /* v14-v15 = int16 filter coefficients (v14%2=0) */
 
         /* Step 5: sign-extend filter int16 -> int32 and accumulate */
         vsetvli zero, a7, e32, m4, ta, ma
-        vsext.vf2 v19, v13          /* v19-v22 (v19 != v13 -- no SIGILL) */
-        vmacc.vv  v0, v15, v19      /* v0-v3 += v15-v18 * v19-v22  (no widening) */
+        vsext.vf2 v20, v14          /* v20-v23 (v20%4=0, m4-aligned) */
+        vmacc.vv  v0, v16, v20      /* v0-v3 += v16-v19 * v20-v23  (no widening) */
 
         /* Advance j */
         addi    t1, t1, 1
         addi    t2, t2, 2           /* filter_j_ptr += sizeof(int16_t) */
         blt     t1, a6, .L_inner
 
-        /* Narrow: e32m4 accumulator -> e16m2, arithmetic right shift 7 */
-        /* In e16m2 mode, vnsra.wi: vd=e16 (v23-v24), vs2=e32 (v0-v3) */
-        vsetvli zero, a7, e16, m2, ta, ma
-        vnsra.wi  v23, v0, 7        /* v23-v24 = int16 output (v23 != v0 -- no SIGILL) */
-        vse16.v   v23, (a1)
+        /*
+         * K1 HARDWARE BUG WORKAROUND: vnsra.wi only writes to even-indexed
+         * elements on K1. Use vsra.vi (same-width >>7) + stack trick to get
+         * correct int16 output via vlse16.v stride=4.
+         *
+         * After vsra.vi + clip to [0, 32767], each int32 value ≤ 0x7FFF,
+         * so the lower 16 bits of each int32 = the correct int16 result.
+         * vlse16.v stride=4 gathers those lower 16-bit halves consecutively.
+         */
+        vsetvli zero, a7, e32, m4, ta, ma
+        vsra.vi  v0, v0, 7                  /* arithmetic >>7 in-place (signed, WORKS on K1) */
+        li       t3, 32767
+        vmin.vx  v0, v0, t3                 /* SIGNED min: clip to <= 32767 (FFMIN semantics) */
+        /* NOTE: do NOT clip negatives - hscale output can be negative int16 */
+
+        /* Store int32 results to stack, load lower 16 bits as int16 */
+        addi     sp, sp, -128               /* 128 bytes: 32 elements × 4 bytes */
+        vse32.v  v0, (sp)                   /* store a7 int32 values */
+        li       t3, 4                      /* stride = 4 (int32 byte size) */
+        vsetvli  zero, a7, e16, m2, ta, ma
+        vlse16.v v24, (sp), t3             /* gather lower 16-bit halves (int16 values) */
+        vse16.v  v24, (a1)                  /* store a7 int16 output pixels */
+        addi     sp, sp, 128               /* restore stack pointer */
 
         /* Advance dst by vl * sizeof(int16_t) */
         slli    t3, a7, 1
