@@ -55,6 +55,8 @@
 
 #pragma GCC diagnostic ignored "-Wdeclaration-after-statement"
 
+#include "spacemitv2d.h"
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * Constants
  * ═══════════════════════════════════════════════════════════════════════════ */
@@ -108,6 +110,10 @@ typedef struct SpacemitMppContext {
     int64_t       pts_queue[SPACEMIT_MPP_OUTPUT_BUFS * 2];
     int           pts_head;
     int           pts_tail;
+
+    /* ── V2D zero-copy: DMA-buf fds exported from OUTPUT buffers ── */
+    int               out_dma_fds[SPACEMIT_MPP_OUTPUT_BUFS][SPACEMIT_MPP_MAX_PLANES];
+    SpacemitV2DCtx    v2d;
 
     /* ── Stream state ── */
     int           started;
@@ -611,6 +617,22 @@ static av_cold int spacemit_mpp_encode_init(AVCodecContext *avctx)
                                             : SPACEMIT_MPP_OUTPUT_BUFS);
     if (ret < 0) goto fail;
 
+    /* Export encoder OUTPUT buffer planes as DMA-buf fds for V2D */
+    memset(s->out_dma_fds, -1, sizeof(s->out_dma_fds));
+    for (int _i = 0; _i < s->n_out && _i < SPACEMIT_MPP_OUTPUT_BUFS; _i++) {
+        for (int _p = 0; _p < s->out_num_planes; _p++) {
+            struct v4l2_exportbuffer expbuf;
+            memset(&expbuf, 0, sizeof(expbuf));
+            expbuf.type  = OUT_TYPE;
+            expbuf.index = (unsigned)_i;
+            expbuf.plane = (unsigned)_p;
+            expbuf.flags = O_CLOEXEC;
+            if (xioctl(s->fd, VIDIOC_EXPBUF, &expbuf) == 0)
+                s->out_dma_fds[_i][_p] = expbuf.fd;
+        }
+    }
+    spacemit_v2d_init(&s->v2d, avctx);   /* non-fatal if V2D unavailable */
+
     ret = alloc_buffers(avctx, CAP_TYPE, s->cap_num_planes,
                         &s->cap_bufs, &s->n_cap,
                         s->num_cap_bufs > 0 ? s->num_cap_bufs
@@ -638,6 +660,12 @@ fail:
     stream_off(s);
     free_buffers(s->out_bufs, s->n_out); s->out_bufs = NULL;
     free_buffers(s->cap_bufs, s->n_cap); s->cap_bufs = NULL;
+    /* Close V2D DMA-buf fds */
+    for (int _i = 0; _i < SPACEMIT_MPP_OUTPUT_BUFS; _i++)
+        for (int _p = 0; _p < SPACEMIT_MPP_MAX_PLANES; _p++)
+            if (s->out_dma_fds[_i][_p] >= 0)
+                close(s->out_dma_fds[_i][_p]);
+    spacemit_v2d_close(&s->v2d);
     if (s->fd >= 0) { close(s->fd); s->fd = -1; }
     return ret;
 }
@@ -661,22 +689,52 @@ static int spacemit_mpp_send_frame(AVCodecContext *avctx, const AVFrame *frame)
     int bi = get_free_output_buf(s);
     if (bi < 0) return AVERROR(EAGAIN);
 
-    if (frame->format == AV_PIX_FMT_YUV420P) {
-        copy_yuv420p_to_planes(&s->out_bufs[bi],
-            frame->data[0], frame->linesize[0],
-            frame->data[1], frame->linesize[1],
-            frame->data[2],
-            s->width, s->height);
-    } else if (frame->format == AV_PIX_FMT_NV12) {
-        copy_nv12_to_planes(&s->out_bufs[bi],
-            frame->data[0], frame->linesize[0],
-            frame->data[1], frame->linesize[1],
-            s->width, s->height);
-    } else {
-        av_log(avctx, AV_LOG_ERROR,
-               "spacemit_mpp: unsupported pixel format %s\n",
-               av_get_pix_fmt_name(frame->format));
-        return AVERROR(EINVAL);
+    /* ── V2D zero-copy path ─────────────────────────────────────────────
+     * If the frame came from the SpacemiT hardware decoder it carries
+     * DMA-buf fds in frame->opaque.  Use V2D to blit directly from the
+     * decoder's CAPTURE buffer into our OUTPUT buffer — no CPU involved.
+     * Falls back to CPU memcpy if V2D is unavailable or opaque is unset.
+     * ─────────────────────────────────────────────────────────────────── */
+    int v2d_used = 0;
+    if (frame->opaque && s->v2d.available &&
+        frame->format == AV_PIX_FMT_NV12) {
+        const SpacemitDMAFrameInfo *dma =
+            (const SpacemitDMAFrameInfo *)frame->opaque;
+        if (dma->dma_fds[0] >= 0) {
+            int ret_v2d = spacemit_v2d_blit(
+                &s->v2d, dma,
+                s->out_dma_fds[bi], s->out_num_planes,
+                s->width, s->height, s->width);
+            if (ret_v2d == 0) {
+                v2d_used = 1;
+                av_log(avctx, AV_LOG_DEBUG,
+                       "spacemit_mpp: V2D blit buf=%d\n", bi);
+            } else {
+                av_log(avctx, AV_LOG_WARNING,
+                       "spacemit_mpp: V2D blit failed, using CPU fallback\n");
+            }
+        }
+    }
+
+    if (!v2d_used) {
+        /* ── CPU fallback path ── */
+        if (frame->format == AV_PIX_FMT_YUV420P) {
+            copy_yuv420p_to_planes(&s->out_bufs[bi],
+                frame->data[0], frame->linesize[0],
+                frame->data[1], frame->linesize[1],
+                frame->data[2],
+                s->width, s->height);
+        } else if (frame->format == AV_PIX_FMT_NV12) {
+            copy_nv12_to_planes(&s->out_bufs[bi],
+                frame->data[0], frame->linesize[0],
+                frame->data[1], frame->linesize[1],
+                s->width, s->height);
+        } else {
+            av_log(avctx, AV_LOG_ERROR,
+                   "spacemit_mpp: unsupported pixel format %s\n",
+                   av_get_pix_fmt_name(frame->format));
+            return AVERROR(EINVAL);
+        }
     }
 
     struct v4l2_plane  planes[SPACEMIT_MPP_MAX_PLANES] = {};
@@ -704,6 +762,10 @@ static int spacemit_mpp_send_frame(AVCodecContext *avctx, const AVFrame *frame)
                "spacemit_mpp: QBUF OUTPUT i=%d failed: %s\n",
                bi, strerror(errno));
         return AVERROR(errno);
+    }
+    /* Release DMA frame info allocated by decoder (if any) */
+    if (frame->opaque) {
+        av_freep(&frame->opaque);
     }
 
     s->out_bufs[bi].queued = 1;
@@ -785,6 +847,12 @@ static av_cold int spacemit_mpp_encode_close(AVCodecContext *avctx)
     stream_off(s);
     free_buffers(s->out_bufs, s->n_out); s->out_bufs = NULL;
     free_buffers(s->cap_bufs, s->n_cap); s->cap_bufs = NULL;
+    /* Close V2D DMA-buf fds */
+    for (int _i = 0; _i < SPACEMIT_MPP_OUTPUT_BUFS; _i++)
+        for (int _p = 0; _p < SPACEMIT_MPP_MAX_PLANES; _p++)
+            if (s->out_dma_fds[_i][_p] >= 0)
+                close(s->out_dma_fds[_i][_p]);
+    spacemit_v2d_close(&s->v2d);
     if (s->fd >= 0) { close(s->fd); s->fd = -1; }
     return 0;
 }
