@@ -2033,6 +2033,7 @@ EXTERNAL_LIBRARY_LIST="
     cairo
     chromaprint
     spacemit_mpp
+    spacemit_v2d
     gcrypt
     gnutls
     jni
@@ -3622,6 +3623,7 @@ h264_spacemit_mpp_decoder_deps="linux_videodev2_h"
 hevc_spacemit_mpp_decoder_deps="linux_videodev2_h"
 vp8_spacemit_mpp_decoder_deps="linux_videodev2_h"
 vp9_spacemit_mpp_decoder_deps="linux_videodev2_h"
+
 hevc_amf_encoder_deps="amf"
 hevc_amf_decoder_deps="amf"
 hevc_cuvid_decoder_deps="cuvid"
@@ -7490,6 +7492,16 @@ enabled ohcodec           && { check_lib ohcodec "multimedia/player_framework/na
                                     "OH_VideoDecoder_CreateByName OH_VideoEncoder_CreateByName" \
                                     -lnative_media_vdec -lnative_media_venc -lnative_media_codecbase -lnative_media_core -lnative_window ||
                                die "ERROR: missing native_media libs"; }
+# SpacemiT K1 V2D 2D blitter: check header + library, enable if found
+if enabled spacemit_mpp; then
+    if check_headers "spacemit/v2d_api.h" &&
+       check_func_headers "spacemit/v2d_compat.h spacemit/v2d_api.h" V2D_BeginJob -lv2d; then
+        enable spacemit_v2d
+        add_extralibs -lv2d
+    else
+        warn "V2D library not found; SpacemiT V2D acceleration disabled"
+    fi
+fi
 enabled openal            && { check_pkg_config openal "openal >= 1.1" "AL/al.h" alGetError ||
                                { for al_extralibs in "${OPENAL_LIBS}" "-lopenal" "-lOpenAL32"; do
                                check_lib openal 'AL/al.h' alGetError "${al_extralibs}" && break; done } ||

@@ -457,15 +457,21 @@ OBJS-$(CONFIG_H264_V4L2M2M_DECODER)    += v4l2_m2m_dec.o
 OBJS-$(CONFIG_H264_V4L2M2M_ENCODER)    += v4l2_m2m_enc.o
 
 # SpacemiT K1 MPP encoders/decoders (V4L2 M2M MPLANE)
-OBJS-$(CONFIG_H264_SPACEMIT_MPP_ENCODER) += spacemitmppenc.o spacemitv2d.o spacemit_v2d_lib.o
-OBJS-$(CONFIG_HEVC_SPACEMIT_MPP_ENCODER) += spacemitmppenc.o spacemitv2d.o spacemit_v2d_lib.o
-OBJS-$(CONFIG_VP8_SPACEMIT_MPP_ENCODER)  += spacemitmppenc.o spacemitv2d.o spacemit_v2d_lib.o
-OBJS-$(CONFIG_VP9_SPACEMIT_MPP_ENCODER)  += spacemitmppenc.o spacemitv2d.o spacemit_v2d_lib.o
+OBJS-$(CONFIG_H264_SPACEMIT_MPP_ENCODER) += spacemitmppenc.o 
+OBJS-$(CONFIG_HEVC_SPACEMIT_MPP_ENCODER) += spacemitmppenc.o 
+OBJS-$(CONFIG_VP8_SPACEMIT_MPP_ENCODER)  += spacemitmppenc.o 
+OBJS-$(CONFIG_VP9_SPACEMIT_MPP_ENCODER)  += spacemitmppenc.o 
 
-OBJS-$(CONFIG_H264_SPACEMIT_MPP_DECODER) += spacemitmppdec.o spacemitv2d.o spacemit_v2d_lib.o
-OBJS-$(CONFIG_HEVC_SPACEMIT_MPP_DECODER) += spacemitmppdec.o spacemitv2d.o spacemit_v2d_lib.o
-OBJS-$(CONFIG_VP8_SPACEMIT_MPP_DECODER)  += spacemitmppdec.o spacemitv2d.o spacemit_v2d_lib.o
-OBJS-$(CONFIG_VP9_SPACEMIT_MPP_DECODER)  += spacemitmppdec.o spacemitv2d.o spacemit_v2d_lib.o
+OBJS-$(CONFIG_H264_SPACEMIT_MPP_DECODER) += spacemitmppdec.o 
+OBJS-$(CONFIG_HEVC_SPACEMIT_MPP_DECODER) += spacemitmppdec.o 
+OBJS-$(CONFIG_VP8_SPACEMIT_MPP_DECODER)  += spacemitmppdec.o 
+OBJS-$(CONFIG_VP9_SPACEMIT_MPP_DECODER)  += spacemitmppdec.o 
+
+# V2D acceleration (enabled when --enable-spacemit_v2d is set)
+OBJS-$(CONFIG_SPACEMIT_V2D)              += spacemitv2d.o
+
+# V2D object added to all spacemit MPP codecs when --enable-spacemit_v2d
+
 OBJS-$(CONFIG_HAP_DECODER)             += hapdec.o hap.o
 OBJS-$(CONFIG_HAP_ENCODER)             += hapenc.o hap.o
 OBJS-$(CONFIG_HCA_DECODER)             += hcadec.o
