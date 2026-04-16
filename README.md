@@ -157,46 +157,6 @@ silently to libswscale if `/dev/v2d_dev` is unavailable.
 
 > Note: same-size copy is slower via V2D due to DMA staging overhead.
 > V2D wins whenever actual scaling is performed.
-
----
-
-## `k1` branch — file summary
-
-```
-configure                              +15 lines (V2D detection, scale_spacemit deps)
-libavcodec/
-  Makefile                            +22 lines
-  spacemitv2d.h                       new  — V2D blit API
-  spacemitv2d.c                       new  — V2D blit implementation
-  spacemitmppenc.c                    +100 lines (V2D path in send_frame)
-libavfilter/
-  Makefile                            +1 line
-  allfilters.c                        +1 line
-  vf_scale_spacemit.c                 new  — V2D scale filter (584 lines)
-  riscv/
-    Makefile                          new
-    vf_nlmeans_init_riscv.c           new  — NLMeans RVV dispatch
-    vf_nlmeans_rvv.S                  new  — NLMeans RVV kernel (240 lines)
-    vf_overlay_init.c                 new  — overlay RVV dispatch
-    vf_overlay_rvv.S                  new  — overlay RVV kernel (244 lines)
-    vf_yadif_init.c                   new  — yadif RVV dispatch
-    vf_yadif_rvv.S                    new  — yadif RVV kernel (260 lines)
-libavutil/
-  imgutils.c                          +12 lines
-  riscv/
-    Makefile                          +2 lines
-    imgutils_rvv.S                    new  — plane copy RVV (57 lines)
-libswscale/riscv/
-  Makefile                            +5 lines
-  hscale_rvv.S                        new  — H-scaler RVV (160 lines)
-  hyscale_fast_rvv.S                  new  — fast bilinear RVV (326 lines)
-  input_rvv.S                         new  — NV12/NV21 UV split (54 lines)
-  output_rvv.S                        new  — vertical output RVV (249 lines)
-  swscale.c                           +66 lines (dispatch registrations)
-```
-
-Total: **2,813 insertions** across 31 files.
-
 ---
 
 ## About (`master` baseline)
