@@ -27,5 +27,6 @@ extern const FFCodec ff_h264_spacemit_mpp_encoder;
 extern const FFCodec ff_hevc_spacemit_mpp_encoder;
 extern const FFCodec ff_vp8_spacemit_mpp_encoder;
 extern const FFCodec ff_vp9_spacemit_mpp_encoder;
+extern const FFCodec ff_mjpeg_spacemit_mpp_encoder;
 
 #endif /* AVCODEC_SPACEMITMPPENC_H */

@@ -1,32 +1,13 @@
 /*
- * spacemitmppdec.c — SpacemiT K1 MPP hardware decoder (FFmpeg codec plugin)
+ * spacemitmppdec.c — SpacemiT K1 MPP hardware video decoder (FFmpeg codec plugin)
  *
- * Provides H.264, H.265, VP8, VP9 hardware decoding via the K1 SoC's
- * Media Processing Pipeline (MPP), exposed through the standard Linux
- * V4L2 M2M kernel interface.
+ * Uses the SpacemiT MPP library (libspacemit_mpp) for H.264/HEVC/VP8/VP9
+ * hardware decoding on the K1 SoC's Linlon V5/V7 VPU.
  *
- * ── K1 driver specifics (mvx / Linlon) ────────────────────────────────────
- *
- * The mvx driver is a MULTIPLANAR M2M device (V4L2_CAP_VIDEO_M2M_MPLANE).
- * All ioctls must use _MPLANE buffer types.
- *
- * Decode direction:
- *   OUTPUT  (V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE)  — compressed bitstream input
- *   CAPTURE (V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) — decoded NV12 frames output
- *
- * After VIDIOC_S_FMT on the CAPTURE side the driver may change num_planes,
- * so we always do VIDIOC_G_FMT to read back the actual plane count:
- *   H264 OUTPUT  → planes = 1  (bitstream, single mmap region)
- *   NV12 CAPTURE → planes = 2  (Y plane + UV plane, separate mmap regions)
- *
- * ── Supported codecs ───────────────────────────────────────────────────────
- *   h264_spacemit_mpp, hevc_spacemit_mpp, vp8_spacemit_mpp, vp9_spacemit_mpp
- *
- * ── Dynamic resolution change ─────────────────────────────────────────────
- *
- * When the driver signals V4L2_EVENT_SOURCE_CHANGE (or returns EPIPE on
- * CAPTURE dequeue) we stop/restart the CAPTURE queue with updated geometry.
- * This is the standard V4L2 stateful codec resolution-change sequence.
+ * Architecture matches the working vdec_demo.c exactly:
+ *   - Send thread: feeds packets via VDEC_Decode (like demo's send_thread_fn)
+ *   - Receive thread: calls VDEC_RequestOutputFrame in tight loop (like demo's main)
+ *   - FFmpeg thread: pulls decoded frames from a queue
  *
  * This file is part of FFmpeg.
  *
@@ -34,689 +15,603 @@
  * modify it under the terms of the GNU Lesser General Public
  * License as published by the Free Software Foundation; either
  * version 2.1 of the License, or (at your option) any later version.
- *
- * FFmpeg is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * Lesser General Public License for more details.
- *
- * You should have received a copy of the GNU Lesser General Public
- * License along with FFmpeg; if not, write to the Free Software
- * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#include <errno.h>
-#include <fcntl.h>
-#include <poll.h>
+#include <stdatomic.h>
 #include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-
-#include <sys/ioctl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-
-#ifndef O_CLOEXEC
-#  define O_CLOEXEC 02000000
-#endif
-#include <linux/videodev2.h>
+#include <pthread.h>
 
 #include "avcodec.h"
+#include "bsf.h"
 #include "codec_internal.h"
 #include "decode.h"
 #include "libavutil/log.h"
-#include "libavutil/opt.h"
-#include "libavutil/pixdesc.h"
-#include "libavutil/avassert.h"
 #include "libavutil/mem.h"
-#include "libavutil/imgutils.h"
-#include "libavutil/frame.h"
+#include "libavutil/pixfmt.h"
 
-#pragma GCC diagnostic ignored "-Wdeclaration-after-statement"
+#include "vdec.h"
+#include "module.h"
+#include "packet.h"
+#include "frame.h"
+#include "para.h"
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * Constants
- * ═══════════════════════════════════════════════════════════════════════════ */
+#define INPUT_BUF_SIZE  (1024 * 1024)
+#define SEND_RING_SIZE  64
+#define FRAME_RING_SIZE 8
 
-#define SPACEMIT_DEC_OUTPUT_BUFS   8   /* compressed input ring */
-#define SPACEMIT_DEC_CAPTURE_BUFS  8   /* decoded frame pool */
-#define SPACEMIT_DEC_MAX_PLANES    3
+typedef struct DecodedFrame {
+    uint8_t *y_data;
+    uint8_t *uv_data;
+    int      y_linesize;
+    int      uv_linesize;
+    int      width;
+    int      height;
+    int64_t  pts;
+    int      valid;
+} DecodedFrame;
 
-#define OUT_TYPE  V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE
-#define CAP_TYPE  V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE
+typedef struct SpacemiTMPPDecContext {
+    const AVClass  *class;
+    MppVdecCtx     *mpp_ctx;
+    MppPacket      *mpp_pkt;
+    MppFrame       *mpp_frame;
+    AVBSFContext   *bsf;
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * V4L2 mmap buffer descriptor
- * ═══════════════════════════════════════════════════════════════════════════ */
+    int             width;
+    int             height;
+    int             draining;
+    int             initialized;
 
-typedef struct DecV4L2Buf {
-    void   *start[SPACEMIT_DEC_MAX_PLANES];
-    size_t  length[SPACEMIT_DEC_MAX_PLANES];
-    int     num_planes;
-    int     index;
-    int     queued;
-} DecV4L2Buf;
+    /* Send thread — feeds packets to MPP */
+    pthread_t       send_thread;
+    int             send_thread_running;
+    atomic_int      send_thread_stop;
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * Private decoder context
- * ═══════════════════════════════════════════════════════════════════════════ */
+    /* SPSC ring: FFmpeg thread → send thread */
+    uint8_t        *send_data[SEND_RING_SIZE];
+    int             send_size[SEND_RING_SIZE];
+    int64_t         send_pts[SEND_RING_SIZE];
+    atomic_int      send_head;
+    atomic_int      send_tail;
+    atomic_int      send_eos;
 
-typedef struct SpacemitMppDecContext {
-    const AVClass *class;
+    /* Receive thread — retrieves decoded frames from MPP */
+    pthread_t       recv_thread;
+    int             recv_thread_running;
+    atomic_int      recv_thread_stop;
+    atomic_int      recv_resolution_changed;
 
-    /* ── AVOptions ── */
-    char         *device;
-    int           num_out_bufs;
-    int           num_cap_bufs;
+    /* SPSC ring: receive thread → FFmpeg thread */
+    DecodedFrame    frame_ring[FRAME_RING_SIZE];
+    atomic_int      frame_head;
+    atomic_int      frame_tail;
 
-    /* ── V4L2 state ── */
-    int           fd;
-    __u32         v4l2_codec;
+    /* Shared state from receive thread */
+    atomic_int      out_width;
+    atomic_int      out_height;
+    atomic_int      eos_received;
+} SpacemiTMPPDecContext;
 
-    int           out_num_planes;
-    int           cap_num_planes;
-
-    DecV4L2Buf   *out_bufs;
-    int           n_out;
-
-    DecV4L2Buf   *cap_bufs;
-    int           n_cap;
-
-    /* ── Output geometry (may change after source_change event) ── */
-    int           width;
-    int           height;
-    int           coded_width;
-    int           coded_height;
-
-    /* ── Stream state ── */
-    int           output_started;
-    int           capture_started;
-    int           draining;
-    int           eof;
-
-    /* ── PTS queue (maps OUTPUT buf index → pts) ── */
-    int64_t       pts_queue[SPACEMIT_DEC_OUTPUT_BUFS * 2];
-
-} SpacemitMppDecContext;
-
-/* ═══════════════════════════════════════════════════════════════════════════
- * Helpers
- * ═══════════════════════════════════════════════════════════════════════════ */
-
-static int xioctl(int fd, unsigned long request, void *arg)
-{
-    int ret;
-    do { ret = ioctl(fd, request, arg); } while (ret == -1 && errno == EINTR);
-    return ret;
-}
-
-static __u32 avcodec_to_v4l2_codec(enum AVCodecID id)
+static MppCodingType codec_id_to_mpp(enum AVCodecID id)
 {
     switch (id) {
-    case AV_CODEC_ID_H264:  return V4L2_PIX_FMT_H264;
-    case AV_CODEC_ID_HEVC:  return V4L2_PIX_FMT_HEVC;
-    case AV_CODEC_ID_VP8:   return V4L2_PIX_FMT_VP8;
-    case AV_CODEC_ID_VP9:   return V4L2_PIX_FMT_VP9;
-    default:                return 0;
+    /* Note: the libspacemit_mpp wrapper has its own whitelist in
+     * checkInputParameters() that is more restrictive than the underlying
+     * Linlon V5/V7 V4L2 driver's advertised format list. Currently it only
+     * accepts H264, H265, MJPEG, VP8, VP9, MPEG2, MPEG4. JPEG (coding 7) is
+     * rejected even though MJPEG (coding 6) is accepted, so map both
+     * AV_CODEC_ID_MJPEG and AV_CODEC_ID_MJPEGB to CODING_MJPEG.
+     * H263, VC1, CAVS, AVS2 are advertised by the V4L2 driver but rejected
+     * by the wrapper — they are not exposed as FFmpeg decoders here. */
+    case AV_CODEC_ID_H264:        return CODING_H264;
+    case AV_CODEC_ID_HEVC:        return CODING_H265;
+    case AV_CODEC_ID_VP8:         return CODING_VP8;
+    case AV_CODEC_ID_MPEG2VIDEO:  return CODING_MPEG2;
+    case AV_CODEC_ID_MPEG4:       return CODING_MPEG4;
+    default:                      return CODING_UNKNOWN;
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * Device probe — find the first V4L2 M2M MPLANE device supporting our codec
- * ═══════════════════════════════════════════════════════════════════════════ */
+/* ---- Send thread (matches demo's send_thread_fn) ---- */
 
-static int find_v4l2_device(AVCodecContext *avctx, __u32 v4l2_codec)
+static int send_ring_enqueue(SpacemiTMPPDecContext *s, uint8_t *data, int size, int64_t pts)
 {
-    SpacemitMppDecContext *s = avctx->priv_data;
-    char path[32];
-    int  i;
-
-    if (s->device && s->device[0]) {
-        s->fd = open(s->device, O_RDWR | O_CLOEXEC | O_NONBLOCK);
-        if (s->fd < 0) {
-            av_log(avctx, AV_LOG_ERROR,
-                   "spacemit_mpp: cannot open %s: %s\n",
-                   s->device, strerror(errno));
-            return AVERROR(errno);
-        }
-        return 0;
-    }
-
-    for (i = 0; i < 16; i++) {
-        snprintf(path, sizeof(path), "/dev/video%d", i);
-        int fd = open(path, O_RDWR | O_CLOEXEC | O_NONBLOCK);
-        if (fd < 0) continue;
-
-        struct v4l2_capability cap = {0};
-        if (xioctl(fd, VIDIOC_QUERYCAP, &cap) < 0) { close(fd); continue; }
-
-        if (!(cap.device_caps & V4L2_CAP_VIDEO_M2M_MPLANE) ||
-            !(cap.device_caps & V4L2_CAP_STREAMING))       { close(fd); continue; }
-
-        /* Check that the driver supports our codec on the OUTPUT side */
-        struct v4l2_fmtdesc fdesc = {0};
-        fdesc.type = OUT_TYPE;
-        int found  = 0;
-        for (fdesc.index = 0; xioctl(fd, VIDIOC_ENUM_FMT, &fdesc) == 0; fdesc.index++) {
-            if (fdesc.pixelformat == v4l2_codec) { found = 1; break; }
-        }
-
-        if (found) {
-            av_log(avctx, AV_LOG_INFO,
-                   "spacemit_mpp dec: using device %s (%s)\n", path, cap.card);
-            s->fd = fd;
-            return 0;
-        }
-        close(fd);
-    }
-    av_log(avctx, AV_LOG_ERROR, "spacemit_mpp: no suitable V4L2 M2M MPLANE decoder\n");
-    return AVERROR(ENODEV);
-}
-
-/* ═══════════════════════════════════════════════════════════════════════════
- * Set formats
- * ═══════════════════════════════════════════════════════════════════════════ */
-
-static int set_formats_mplane(AVCodecContext *avctx)
-{
-    SpacemitMppDecContext *s = avctx->priv_data;
-    int w = avctx->width  > 0 ? avctx->width  : 1920;
-    int h = avctx->height > 0 ? avctx->height : 1080;
-
-    /* OUTPUT: compressed bitstream */
-    {
-        struct v4l2_format fmt = {0};
-        fmt.type                                 = OUT_TYPE;
-        fmt.fmt.pix_mp.width                     = w;
-        fmt.fmt.pix_mp.height                    = h;
-        fmt.fmt.pix_mp.pixelformat               = s->v4l2_codec;
-        fmt.fmt.pix_mp.field                     = V4L2_FIELD_NONE;
-        fmt.fmt.pix_mp.num_planes                = 1;
-        fmt.fmt.pix_mp.plane_fmt[0].sizeimage    = w * h;  /* bitstream buffer */
-        if (xioctl(s->fd, VIDIOC_S_FMT, &fmt) < 0) {
-            av_log(avctx, AV_LOG_ERROR,
-                   "spacemit_mpp dec: S_FMT OUTPUT failed: %s\n", strerror(errno));
-            return AVERROR(errno);
-        }
-        struct v4l2_format gfmt = {0};
-        gfmt.type = OUT_TYPE;
-        if (xioctl(s->fd, VIDIOC_G_FMT, &gfmt) == 0)
-            s->out_num_planes = gfmt.fmt.pix_mp.num_planes;
-        else
-            s->out_num_planes = 1;
-        av_log(avctx, AV_LOG_INFO,
-               "spacemit_mpp dec: OUTPUT fmt=0x%x planes=%d\n",
-               s->v4l2_codec, s->out_num_planes);
-    }
-
-    /* CAPTURE: decoded NV12 */
-    {
-        struct v4l2_format fmt = {0};
-        fmt.type                                 = CAP_TYPE;
-        fmt.fmt.pix_mp.width                     = w;
-        fmt.fmt.pix_mp.height                    = h;
-        fmt.fmt.pix_mp.pixelformat               = V4L2_PIX_FMT_NV12;
-        fmt.fmt.pix_mp.field                     = V4L2_FIELD_NONE;
-        fmt.fmt.pix_mp.num_planes                = 2;
-        fmt.fmt.pix_mp.plane_fmt[0].sizeimage    = w * h;
-        fmt.fmt.pix_mp.plane_fmt[1].sizeimage    = w * h / 2;
-        if (xioctl(s->fd, VIDIOC_S_FMT, &fmt) < 0) {
-            av_log(avctx, AV_LOG_ERROR,
-                   "spacemit_mpp dec: S_FMT CAPTURE NV12 failed: %s\n", strerror(errno));
-            return AVERROR(errno);
-        }
-        struct v4l2_format gfmt = {0};
-        gfmt.type = CAP_TYPE;
-        if (xioctl(s->fd, VIDIOC_G_FMT, &gfmt) == 0) {
-            s->cap_num_planes = gfmt.fmt.pix_mp.num_planes;
-            s->coded_width    = gfmt.fmt.pix_mp.width;
-            s->coded_height   = gfmt.fmt.pix_mp.height;
-        } else {
-            s->cap_num_planes = 2;
-            s->coded_width    = w;
-            s->coded_height   = h;
-        }
-        av_log(avctx, AV_LOG_INFO,
-               "spacemit_mpp dec: CAPTURE %dx%d planes=%d\n",
-               s->coded_width, s->coded_height, s->cap_num_planes);
-    }
+    int head = atomic_load_explicit(&s->send_head, memory_order_relaxed);
+    int next = (head + 1) % SEND_RING_SIZE;
+    int tail = atomic_load_explicit(&s->send_tail, memory_order_acquire);
+    if (next == tail) return -1;
+    s->send_data[head] = data;
+    s->send_size[head] = size;
+    s->send_pts[head]  = pts;
+    atomic_store_explicit(&s->send_head, next, memory_order_release);
     return 0;
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * Buffer allocation
- * ═══════════════════════════════════════════════════════════════════════════ */
-
-static int alloc_buffers(AVCodecContext *avctx, __u32 type,
-                          int n_req, int num_planes,
-                          DecV4L2Buf **bufs_out, int *n_out)
+static void *send_thread_func(void *arg)
 {
-    SpacemitMppDecContext *s = avctx->priv_data;
-    struct v4l2_requestbuffers req = {0};
-    req.count  = n_req;
-    req.type   = type;
-    req.memory = V4L2_MEMORY_MMAP;
-    if (xioctl(s->fd, VIDIOC_REQBUFS, &req) < 0) {
-        av_log(avctx, AV_LOG_ERROR,
-               "spacemit_mpp dec: REQBUFS type=%u failed: %s\n",
-               type, strerror(errno));
-        return AVERROR(errno);
-    }
+    SpacemiTMPPDecContext *s = arg;
 
-    *n_out  = req.count;
-    *bufs_out = av_calloc(req.count, sizeof(DecV4L2Buf));
-    if (!*bufs_out) return AVERROR(ENOMEM);
+    while (!atomic_load_explicit(&s->send_thread_stop, memory_order_relaxed)) {
+        int tail = atomic_load_explicit(&s->send_tail, memory_order_relaxed);
+        int head = atomic_load_explicit(&s->send_head, memory_order_acquire);
 
-    for (unsigned i = 0; i < req.count; i++) {
-        struct v4l2_buffer     buf  = {0};
-        struct v4l2_plane      planes[SPACEMIT_DEC_MAX_PLANES] = {{0}};
-        buf.index    = i;
-        buf.type     = type;
-        buf.memory   = V4L2_MEMORY_MMAP;
-        buf.length   = num_planes;
-        buf.m.planes = planes;
-
-        if (xioctl(s->fd, VIDIOC_QUERYBUF, &buf) < 0) {
-            av_log(avctx, AV_LOG_ERROR,
-                   "spacemit_mpp dec: QUERYBUF %u failed: %s\n", i, strerror(errno));
-            return AVERROR(errno);
+        if (tail == head) {
+            if (atomic_load_explicit(&s->send_eos, memory_order_acquire)) {
+                PACKET_SetLength(s->mpp_pkt, 0);
+                PACKET_SetEos(s->mpp_pkt, MPP_TRUE);
+                for (int i = 0; i < 100; i++) {
+                    S32 r = VDEC_Decode(s->mpp_ctx, PACKET_GetBaseData(s->mpp_pkt));
+                    if (r == MPP_OK) break;
+                    usleep(5000);
+                }
+                return NULL;
+            }
+            usleep(1000);
+            continue;
         }
 
-        (*bufs_out)[i].num_planes = num_planes;
-        (*bufs_out)[i].index      = i;
-        for (int p = 0; p < num_planes; p++) {
-            (*bufs_out)[i].length[p] = planes[p].length;
-            (*bufs_out)[i].start[p]  = mmap(NULL, planes[p].length,
-                                             PROT_READ | PROT_WRITE, MAP_SHARED,
-                                             s->fd, planes[p].m.mem_offset);
-            if ((*bufs_out)[i].start[p] == MAP_FAILED) {
-                av_log(avctx, AV_LOG_ERROR,
-                       "spacemit_mpp dec: mmap buf %u plane %d failed: %s\n",
-                       i, p, strerror(errno));
-                return AVERROR(errno);
+        uint8_t *data = s->send_data[tail];
+        int      size = s->send_size[tail];
+        int64_t  pts  = s->send_pts[tail];
+
+        if (size > 0 && size <= INPUT_BUF_SIZE) {
+            void *buf = PACKET_GetDataPointer(s->mpp_pkt);
+            memcpy(buf, data, size);
+            PACKET_SetLength(s->mpp_pkt, size);
+            PACKET_SetPts(s->mpp_pkt, pts);
+            PACKET_SetEos(s->mpp_pkt, MPP_FALSE);
+
+            static int sent_count = 0;
+            for (int retry = 0; retry < 5000; retry++) {
+                if (atomic_load_explicit(&s->send_thread_stop, memory_order_relaxed))
+                    return NULL;
+                S32 r = VDEC_Decode(s->mpp_ctx, PACKET_GetBaseData(s->mpp_pkt));
+                if (r == MPP_OK) {
+                    sent_count++;
+                    break;
+                }
+                if (r == MPP_DATAQUEUE_FULL || r == MPP_POLL_FAILED ||
+                    r == MPP_CODER_NO_DATA) {
+                    /* Transient back-pressure from the V4L2 input queue
+                     * waiting for output drain; just retry. */
+                    usleep(2000);
+                    continue;
+                }
+                av_log(NULL, AV_LOG_ERROR,
+                       "spacemit_mpp: VDEC_Decode returned %d\n", r);
+                break;
+            }
+        }
+
+        av_free(data);
+        atomic_store_explicit(&s->send_tail, (tail + 1) % SEND_RING_SIZE,
+                              memory_order_release);
+    }
+    return NULL;
+}
+
+/* ---- Receive thread (matches demo's main loop) ---- */
+
+static int frame_ring_enqueue(SpacemiTMPPDecContext *s, DecodedFrame *df)
+{
+    int head = atomic_load_explicit(&s->frame_head, memory_order_relaxed);
+    int next = (head + 1) % FRAME_RING_SIZE;
+    int tail = atomic_load_explicit(&s->frame_tail, memory_order_acquire);
+    if (next == tail) return -1;
+    s->frame_ring[head] = *df;
+    atomic_store_explicit(&s->frame_head, next, memory_order_release);
+    return 0;
+}
+
+static void *recv_thread_func(void *arg)
+{
+    SpacemiTMPPDecContext *s = arg;
+
+    while (!atomic_load_explicit(&s->recv_thread_stop, memory_order_relaxed)) {
+        int ret = VDEC_RequestOutputFrame(s->mpp_ctx, FRAME_GetBaseData(s->mpp_frame));
+
+        if (ret == MPP_OK) {
+            if (FRAME_GetEos(s->mpp_frame) != FRAME_NO_EOS) {
+                VDEC_ReturnOutputFrame(s->mpp_ctx, FRAME_GetBaseData(s->mpp_frame));
+                atomic_store(&s->eos_received, 1);
+                return NULL;
+            }
+
+            MppVdecPara *p = &s->mpp_ctx->stVdecPara;
+            int w = p->nWidth;
+            int h = p->nHeight;
+            int stride = p->nStride > 0 ? p->nStride : w;
+
+            if (w > 0 && h > 0) {
+                uint8_t *y_src  = (uint8_t *)FRAME_GetDataPointer(s->mpp_frame, 0);
+                uint8_t *uv_src = (uint8_t *)FRAME_GetDataPointer(s->mpp_frame, 1);
+
+                if (y_src && uv_src) {
+                    /* Copy frame data to our own buffer */
+                    size_t y_size = (size_t)h * w;
+                    size_t uv_size = (size_t)(h / 2) * w;
+                    uint8_t *y_buf = av_malloc(y_size);
+                    uint8_t *uv_buf = av_malloc(uv_size);
+
+                    if (y_buf && uv_buf) {
+                        for (int i = 0; i < h; i++)
+                            memcpy(y_buf + i * w, y_src + i * stride, w);
+                        for (int i = 0; i < h / 2; i++)
+                            memcpy(uv_buf + i * w, uv_src + i * stride, w);
+
+                        /* The K1 Linlon V5/V7 plugin does not propagate
+                         * the input packet PTS through to the decoded frame
+                         * (FRAME_GetPts always returns the same bogus value
+                         * of 2^32). Returning that as the AVFrame pts causes
+                         * FFmpeg's muxer to drop everything after the first
+                         * frame as non-monotonic. AV_NOPTS_VALUE tells FFmpeg
+                         * to derive PTS from the stream framerate. */
+                        DecodedFrame df = {
+                            .y_data = y_buf, .uv_data = uv_buf,
+                            .y_linesize = w, .uv_linesize = w,
+                            .width = w, .height = h,
+                            .pts = AV_NOPTS_VALUE,
+                            .valid = 1,
+                        };
+
+                        /* Block until the consumer ring has space.
+                         * Dropping frames here loses real video data and
+                         * makes the decoder emit only a handful of frames. */
+                        while (!atomic_load_explicit(&s->recv_thread_stop,
+                                                     memory_order_relaxed) &&
+                               frame_ring_enqueue(s, &df) < 0) {
+                            usleep(1000);
+                        }
+                        if (atomic_load_explicit(&s->recv_thread_stop,
+                                                 memory_order_relaxed)) {
+                            av_free(y_buf);
+                            av_free(uv_buf);
+                        } else {
+                            atomic_store(&s->out_width, w);
+                            atomic_store(&s->out_height, h);
+                        }
+                    } else {
+                        av_free(y_buf);
+                        av_free(uv_buf);
+                    }
+                }
+            }
+            VDEC_ReturnOutputFrame(s->mpp_ctx, FRAME_GetBaseData(s->mpp_frame));
+
+        } else if (ret == MPP_RESOLUTION_CHANGED) {
+            /* Like demo: just continue polling */
+            usleep(2000);
+        } else if (ret == MPP_CODER_EOS) {
+            atomic_store(&s->eos_received, 1);
+            return NULL;
+        } else {
+            usleep(2000);
+        }
+    }
+    return NULL;
+}
+
+/* ---- FFmpeg interface ---- */
+
+static int spacemit_decode_init(AVCodecContext *avctx)
+{
+    SpacemiTMPPDecContext *s = avctx->priv_data;
+    int ret;
+
+    s->width  = avctx->width;
+    s->height = avctx->height;
+
+    /* Bitstream filter: convert MP4-style length-prefixed NALs to Annex-B
+     * if needed. Both filters are no-ops on already-Annex-B input, so it's
+     * safe to always wire them up. NB: av_bsf_alloc already allocates
+     * par_in/par_out -- overwriting par_in leaks memory, and aliasing
+     * extradata via direct pointer assignment causes a double-free at close
+     * (the BSF frees par_in->extradata, then avctx frees its own copy).
+     * avcodec_parameters_from_context() does the proper deep copy. */
+    {
+        const char *bsf_name = NULL;
+        if      (avctx->codec_id == AV_CODEC_ID_H264) bsf_name = "h264_mp4toannexb";
+        else if (avctx->codec_id == AV_CODEC_ID_HEVC) bsf_name = "hevc_mp4toannexb";
+        if (bsf_name) {
+            const AVBitStreamFilter *f = av_bsf_get_by_name(bsf_name);
+            if (f) {
+                ret = av_bsf_alloc(f, &s->bsf);
+                if (ret < 0) return ret;
+                ret = avcodec_parameters_from_context(s->bsf->par_in, avctx);
+                if (ret < 0) { av_bsf_free(&s->bsf); return ret; }
+                s->bsf->time_base_in = avctx->time_base;
+                ret = av_bsf_init(s->bsf);
+                if (ret < 0) { av_bsf_free(&s->bsf); return ret; }
             }
         }
     }
+
+    s->mpp_ctx = VDEC_CreateChannel();
+    if (!s->mpp_ctx) return AVERROR_EXTERNAL;
+
+    s->mpp_ctx->eCodecType = CODEC_V4L2_LINLONV5V7;
+    s->mpp_ctx->pModule    = module_init(CODEC_V4L2_LINLONV5V7);
+    if (!s->mpp_ctx->pModule) return AVERROR_EXTERNAL;
+
+    /* Initial size is just a hint for V4L2 input/output buffer allocation;
+     * the decoder reconfigures on V4L2_EVENT_SOURCE_CHANGE once it parses
+     * the real SPS. Use the size from avctx if the demuxer/parser provided
+     * one (covers MP4/MKV/etc.), and only fall back to 1080p when we have
+     * absolutely no information (e.g. raw elementary streams). */
+    s->mpp_ctx->stVdecPara.eCodingType             = codec_id_to_mpp(avctx->codec_id);
+    s->mpp_ctx->stVdecPara.nWidth                  = avctx->width  > 0 ? avctx->width  : 1920;
+    s->mpp_ctx->stVdecPara.nHeight                 = avctx->height > 0 ? avctx->height : 1080;
+    s->mpp_ctx->stVdecPara.eOutputPixelFormat      = PIXEL_FORMAT_NV12;
+    s->mpp_ctx->stVdecPara.nHorizonScaleDownRatio  = 1;
+    s->mpp_ctx->stVdecPara.nVerticalScaleDownRatio = 1;
+    s->mpp_ctx->stVdecPara.bIsFrameReordering      = MPP_TRUE;
+    s->mpp_ctx->stVdecPara.bThumbnailMode          = MPP_FALSE;
+    s->mpp_ctx->stVdecPara.bNoBFrames              = MPP_FALSE;
+
+    ret = VDEC_Init(s->mpp_ctx);
+    if (ret != MPP_OK) return AVERROR_EXTERNAL;
+
+    s->mpp_pkt = PACKET_Create();
+    if (!s->mpp_pkt) return AVERROR_EXTERNAL;
+    PACKET_Alloc(s->mpp_pkt, INPUT_BUF_SIZE);
+
+    s->mpp_frame = FRAME_Create();
+    if (!s->mpp_frame) return AVERROR_EXTERNAL;
+
+    atomic_init(&s->send_head, 0);
+    atomic_init(&s->send_tail, 0);
+    atomic_init(&s->send_eos, 0);
+    atomic_init(&s->send_thread_stop, 0);
+    atomic_init(&s->recv_thread_stop, 0);
+    atomic_init(&s->recv_resolution_changed, 0);
+    atomic_init(&s->frame_head, 0);
+    atomic_init(&s->frame_tail, 0);
+    atomic_init(&s->out_width, 0);
+    atomic_init(&s->out_height, 0);
+    atomic_init(&s->eos_received, 0);
+
+    /* Start receive thread first (like demo: main thread starts before send) */
+    ret = pthread_create(&s->recv_thread, NULL, recv_thread_func, s);
+    if (ret != 0) return AVERROR_EXTERNAL;
+    s->recv_thread_running = 1;
+
+    /* Start send thread */
+    ret = pthread_create(&s->send_thread, NULL, send_thread_func, s);
+    if (ret != 0) return AVERROR_EXTERNAL;
+    s->send_thread_running = 1;
+
+    s->initialized = 1;
+    av_log(avctx, AV_LOG_INFO, "SpacemiT MPP decoder initialized: %s %dx%d\n",
+           avcodec_get_name(avctx->codec_id), avctx->width, avctx->height);
     return 0;
 }
 
-static void free_dec_buffers(DecV4L2Buf *bufs, int n)
+static int spacemit_decode_receive_frame(AVCodecContext *avctx, AVFrame *frame)
 {
-    if (!bufs) return;
-    for (int i = 0; i < n; i++)
-        for (int p = 0; p < bufs[i].num_planes; p++)
-            if (bufs[i].start[p] && bufs[i].start[p] != MAP_FAILED)
-                munmap(bufs[i].start[p], bufs[i].length[p]);
-    av_free(bufs);
-}
-
-/* ═══════════════════════════════════════════════════════════════════════════
- * Queue all CAPTURE buffers so the driver can fill them
- * ═══════════════════════════════════════════════════════════════════════════ */
-
-static int queue_all_capture_bufs(AVCodecContext *avctx)
-{
-    SpacemitMppDecContext *s = avctx->priv_data;
-    for (int i = 0; i < s->n_cap; i++) {
-        struct v4l2_buffer  buf    = {0};
-        struct v4l2_plane   planes[SPACEMIT_DEC_MAX_PLANES] = {{0}};
-        buf.index    = i;
-        buf.type     = CAP_TYPE;
-        buf.memory   = V4L2_MEMORY_MMAP;
-        buf.length   = s->cap_num_planes;
-        buf.m.planes = planes;
-        for (int p = 0; p < s->cap_num_planes; p++)
-            planes[p].length = s->cap_bufs[i].length[p];
-        if (xioctl(s->fd, VIDIOC_QBUF, &buf) < 0) {
-            av_log(avctx, AV_LOG_ERROR,
-                   "spacemit_mpp dec: QBUF CAPTURE %d failed: %s\n",
-                   i, strerror(errno));
-            return AVERROR(errno);
-        }
-        s->cap_bufs[i].queued = 1;
-    }
-    return 0;
-}
-
-static int stream_on(AVCodecContext *avctx, __u32 type)
-{
-    SpacemitMppDecContext *s = avctx->priv_data;
-    if (xioctl(s->fd, VIDIOC_STREAMON, &type) < 0) {
-        av_log(avctx, AV_LOG_ERROR,
-               "spacemit_mpp dec: STREAMON type=%u failed: %s\n",
-               type, strerror(errno));
-        return AVERROR(errno);
-    }
-    return 0;
-}
-
-static void stream_off_dec(SpacemitMppDecContext *s)
-{
-    __u32 t;
-    t = OUT_TYPE; xioctl(s->fd, VIDIOC_STREAMOFF, &t);
-    t = CAP_TYPE; xioctl(s->fd, VIDIOC_STREAMOFF, &t);
-    s->output_started  = 0;
-    s->capture_started = 0;
-}
-
-/* ═══════════════════════════════════════════════════════════════════════════
- * Init / Close
- * ═══════════════════════════════════════════════════════════════════════════ */
-
-static av_cold int spacemit_mpp_decode_init(AVCodecContext *avctx)
-{
-    SpacemitMppDecContext *s = avctx->priv_data;
+    SpacemiTMPPDecContext *s = avctx->priv_data;
     int ret;
 
-    s->fd          = -1;
-    s->v4l2_codec  = avcodec_to_v4l2_codec(avctx->codec_id);
-    s->num_out_bufs = s->num_out_bufs > 0 ? s->num_out_bufs : SPACEMIT_DEC_OUTPUT_BUFS;
-    s->num_cap_bufs = s->num_cap_bufs > 0 ? s->num_cap_bufs : SPACEMIT_DEC_CAPTURE_BUFS;
+    /* Try to get a decoded frame from the receive thread's queue */
+    int tail = atomic_load_explicit(&s->frame_tail, memory_order_relaxed);
+    int head = atomic_load_explicit(&s->frame_head, memory_order_acquire);
 
-    if (!s->v4l2_codec) {
-        av_log(avctx, AV_LOG_ERROR, "spacemit_mpp: unsupported codec %d\n",
-               avctx->codec_id);
-        return AVERROR(ENOSYS);
-    }
+    if (tail != head) {
+        DecodedFrame *df = &s->frame_ring[tail];
 
-    /* Initialize pts queue */
-    for (int i = 0; i < (int)FF_ARRAY_ELEMS(s->pts_queue); i++)
-        s->pts_queue[i] = AV_NOPTS_VALUE;
+        int w = atomic_load(&s->out_width);
+        int h = atomic_load(&s->out_height);
+        if (w != s->width || h != s->height) {
+            av_log(avctx, AV_LOG_INFO, "Resolution: %dx%d -> %dx%d\n",
+                   s->width, s->height, w, h);
+            s->width  = w;
+            s->height = h;
+        }
+        avctx->width  = w;
+        avctx->height = h;
 
-    if ((ret = find_v4l2_device(avctx, s->v4l2_codec)) < 0)
-        return ret;
+        frame->format = AV_PIX_FMT_NV12;
+        frame->width  = df->width;
+        frame->height = df->height;
+        frame->pts    = df->pts;
 
-    if ((ret = set_formats_mplane(avctx)) < 0)
-        goto fail;
+        ret = av_frame_get_buffer(frame, 0);
+        if (ret < 0) {
+            av_free(df->y_data);
+            av_free(df->uv_data);
+            atomic_store_explicit(&s->frame_tail, (tail + 1) % FRAME_RING_SIZE,
+                                  memory_order_release);
+            return ret;
+        }
 
-    if ((ret = alloc_buffers(avctx, OUT_TYPE, s->num_out_bufs,
-                              s->out_num_planes, &s->out_bufs, &s->n_out)) < 0)
-        goto fail;
+        for (int i = 0; i < df->height; i++)
+            memcpy(frame->data[0] + i * frame->linesize[0],
+                   df->y_data + i * df->y_linesize, df->width);
+        for (int i = 0; i < df->height / 2; i++)
+            memcpy(frame->data[1] + i * frame->linesize[1],
+                   df->uv_data + i * df->uv_linesize, df->width);
 
-    if ((ret = alloc_buffers(avctx, CAP_TYPE, s->num_cap_bufs,
-                              s->cap_num_planes, &s->cap_bufs, &s->n_cap)) < 0)
-        goto fail;
+        av_free(df->y_data);
+        av_free(df->uv_data);
+        df->y_data = NULL;
+        df->uv_data = NULL;
 
-    if ((ret = queue_all_capture_bufs(avctx)) < 0)
-        goto fail;
-
-    if ((ret = stream_on(avctx, CAP_TYPE)) < 0)
-        goto fail;
-    s->capture_started = 1;
-
-    avctx->pix_fmt = AV_PIX_FMT_NV12;
-    if (avctx->width  <= 0) avctx->width  = s->coded_width;
-    if (avctx->height <= 0) avctx->height = s->coded_height;
-
-    return 0;
-
-fail:
-    free_dec_buffers(s->out_bufs, s->n_out); s->out_bufs = NULL;
-    free_dec_buffers(s->cap_bufs, s->n_cap); s->cap_bufs = NULL;
-    if (s->fd >= 0) { close(s->fd); s->fd = -1; }
-    return ret;
-}
-
-/* ═══════════════════════════════════════════════════════════════════════════
- * Send packet — copy compressed data into an OUTPUT buffer and queue it
- * ═══════════════════════════════════════════════════════════════════════════ */
-
-static int spacemit_mpp_send_packet(AVCodecContext *avctx, const AVPacket *pkt)
-{
-    SpacemitMppDecContext *s = avctx->priv_data;
-    struct v4l2_buffer  buf    = {0};
-    struct v4l2_plane   planes[SPACEMIT_DEC_MAX_PLANES] = {{0}};
-    int i;
-
-    /* EOS: send zero-length packet */
-    if (!pkt || pkt->size == 0) {
-        buf.type     = OUT_TYPE;
-        buf.memory   = V4L2_MEMORY_MMAP;
-        buf.length   = s->out_num_planes;
-        buf.m.planes = planes;
-        buf.flags    = V4L2_BUF_FLAG_LAST;
-        /* find any free output buffer */
-        for (i = 0; i < s->n_out; i++)
-            if (!s->out_bufs[i].queued) break;
-        if (i == s->n_out) return AVERROR(EAGAIN);
-        buf.index = i;
-        planes[0].bytesused = 0;
-        planes[0].length    = s->out_bufs[i].length[0];
-        s->out_bufs[i].queued = 1;
-        s->draining = 1;
-        if (xioctl(s->fd, VIDIOC_QBUF, &buf) < 0)
-            return AVERROR(errno);
+        atomic_store_explicit(&s->frame_tail, (tail + 1) % FRAME_RING_SIZE,
+                              memory_order_release);
         return 0;
     }
 
-    if (pkt->size > (int)s->out_bufs[0].length[0]) {
-        av_log(avctx, AV_LOG_ERROR,
-               "spacemit_mpp dec: packet size %d > buffer %zu\n",
-               pkt->size, s->out_bufs[0].length[0]);
-        return AVERROR(EINVAL);
-    }
+    /* No frame available */
+    if (atomic_load(&s->eos_received))
+        return AVERROR_EOF;
 
-    /* Find a free OUTPUT buffer */
-    for (i = 0; i < s->n_out; i++)
-        if (!s->out_bufs[i].queued) break;
-    if (i == s->n_out) return AVERROR(EAGAIN);
-
-    memcpy(s->out_bufs[i].start[0], pkt->data, pkt->size);
-    s->pts_queue[i % (int)FF_ARRAY_ELEMS(s->pts_queue)] = pkt->pts;
-
-    buf.index    = i;
-    buf.type     = OUT_TYPE;
-    buf.memory   = V4L2_MEMORY_MMAP;
-    buf.length   = s->out_num_planes;
-    buf.m.planes = planes;
-    buf.timestamp.tv_sec  = pkt->pts / AV_TIME_BASE;
-    buf.timestamp.tv_usec = (pkt->pts % AV_TIME_BASE) * 1000000 / AV_TIME_BASE;
-    planes[0].bytesused = pkt->size;
-    planes[0].length    = s->out_bufs[i].length[0];
-
-    s->out_bufs[i].queued = 1;
-    if (xioctl(s->fd, VIDIOC_QBUF, &buf) < 0) {
-        s->out_bufs[i].queued = 0;
-        av_log(avctx, AV_LOG_ERROR,
-               "spacemit_mpp dec: QBUF OUTPUT %d failed: %s\n", i, strerror(errno));
-        return AVERROR(errno);
-    }
-
-    if (!s->output_started) {
-        if (stream_on(avctx, OUT_TYPE) < 0)
-            return AVERROR(errno);
-        s->output_started = 1;
-    }
-
-    return 0;
-}
-
-/* ═══════════════════════════════════════════════════════════════════════════
- * Receive frame — dequeue a CAPTURE buffer and copy into AVFrame
- * ═══════════════════════════════════════════════════════════════════════════ */
-
-static int spacemit_mpp_receive_frame(AVCodecContext *avctx, AVFrame *frame)
-{
-    SpacemitMppDecContext *s = avctx->priv_data;
-    struct v4l2_buffer  cap    = {0};
-    struct v4l2_plane   cplanes[SPACEMIT_DEC_MAX_PLANES] = {{0}};
-    struct v4l2_buffer  out    = {0};
-    struct v4l2_plane   oplanes[SPACEMIT_DEC_MAX_PLANES] = {{0}};
-    struct pollfd       pfd    = { .fd = s->fd, .events = POLLIN | POLLOUT };
-    int ret;
-
-    if (s->eof) return AVERROR_EOF;
-
-    /* Poll for data availability (100 ms timeout) */
-    ret = poll(&pfd, 1, 100);
-    if (ret < 0)  return AVERROR(errno);
-    if (ret == 0) return AVERROR(EAGAIN);  /* timeout */
-
-    /* Reclaim any done OUTPUT buffers */
-    if (pfd.revents & POLLOUT) {
-        out.type     = OUT_TYPE;
-        out.memory   = V4L2_MEMORY_MMAP;
-        out.length   = s->out_num_planes;
-        out.m.planes = oplanes;
-        while (xioctl(s->fd, VIDIOC_DQBUF, &out) == 0) {
-            if (out.index < (unsigned)s->n_out)
-                s->out_bufs[out.index].queued = 0;
-            /* Reset for next call */
-            memset(&out,    0, sizeof(out));
-            memset(oplanes, 0, sizeof(oplanes));
-            out.type     = OUT_TYPE;
-            out.memory   = V4L2_MEMORY_MMAP;
-            out.length   = s->out_num_planes;
-            out.m.planes = oplanes;
+    if (s->draining) {
+        /* Wait for remaining frames or EOS */
+        for (int i = 0; i < 500; i++) {
+            usleep(2000);
+            head = atomic_load_explicit(&s->frame_head, memory_order_acquire);
+            if (head != atomic_load_explicit(&s->frame_tail, memory_order_relaxed))
+                return spacemit_decode_receive_frame(avctx, frame);
+            if (atomic_load(&s->eos_received))
+                return AVERROR_EOF;
         }
-    }
-
-    /* Dequeue a decoded CAPTURE frame */
-    if (!(pfd.revents & POLLIN))
-        return AVERROR(EAGAIN);
-
-    cap.type     = CAP_TYPE;
-    cap.memory   = V4L2_MEMORY_MMAP;
-    cap.length   = s->cap_num_planes;
-    cap.m.planes = cplanes;
-    if (xioctl(s->fd, VIDIOC_DQBUF, &cap) < 0) {
-        if (errno == EPIPE || errno == EAGAIN)
-            return s->draining ? AVERROR_EOF : AVERROR(EAGAIN);
-        av_log(avctx, AV_LOG_ERROR,
-               "spacemit_mpp dec: DQBUF CAPTURE failed: %s\n", strerror(errno));
-        return AVERROR(errno);
-    }
-
-    /* EOS marker from the driver */
-    if (cap.flags & V4L2_BUF_FLAG_LAST) {
-        /* Re-queue the buffer even if empty */
-        xioctl(s->fd, VIDIOC_QBUF, &cap);
-        s->eof = 1;
         return AVERROR_EOF;
     }
 
-    /* Build AVFrame from the decoded NV12 buffer */
-    frame->format = AV_PIX_FMT_NV12;
-    frame->width  = s->coded_width;
-    frame->height = s->coded_height;
-    if ((ret = av_frame_get_buffer(frame, 32)) < 0) {
-        xioctl(s->fd, VIDIOC_QBUF, &cap);
-        return ret;
+    /* Get packets from FFmpeg and enqueue for send thread */
+    for (int batch = 0; batch < 8; batch++) {
+        AVPacket *pkt = av_packet_alloc();
+        if (!pkt) return AVERROR(ENOMEM);
+
+        ret = ff_decode_get_packet(avctx, pkt);
+        if (ret == AVERROR_EOF) {
+            av_packet_free(&pkt);
+            av_log(avctx, AV_LOG_INFO, "All packets sent, entering drain mode\n");
+            atomic_store_explicit(&s->send_eos, 1, memory_order_release);
+            s->draining = 1;
+            /* Wait a bit for remaining frames */
+            for (int i = 0; i < 1000; i++) {
+                usleep(2000);
+                head = atomic_load_explicit(&s->frame_head, memory_order_acquire);
+                if (head != atomic_load_explicit(&s->frame_tail, memory_order_relaxed))
+                    return spacemit_decode_receive_frame(avctx, frame);
+                if (atomic_load(&s->eos_received))
+                    return AVERROR_EOF;
+            }
+            return AVERROR_EOF;
+        } else if (ret < 0) {
+            av_packet_free(&pkt);
+            return ret;
+        }
+
+        if (s->bsf) {
+            ret = av_bsf_send_packet(s->bsf, pkt);
+            if (ret < 0) { av_packet_free(&pkt); return ret; }
+            ret = av_bsf_receive_packet(s->bsf, pkt);
+            if (ret < 0) { av_packet_free(&pkt); return AVERROR(EAGAIN); }
+        }
+
+        if (pkt->size > 0) {
+            int sz = pkt->size > INPUT_BUF_SIZE ? INPUT_BUF_SIZE : pkt->size;
+            uint8_t *data = av_malloc(sz);
+            if (!data) { av_packet_free(&pkt); return AVERROR(ENOMEM); }
+            memcpy(data, pkt->data, sz);
+            if (send_ring_enqueue(s, data, sz, pkt->pts) < 0)
+                av_free(data);
+        }
+        av_packet_free(&pkt);
+
+        /* Check if a frame arrived */
+        head = atomic_load_explicit(&s->frame_head, memory_order_acquire);
+        if (head != atomic_load_explicit(&s->frame_tail, memory_order_relaxed))
+            return spacemit_decode_receive_frame(avctx, frame);
     }
 
-    /* Y plane */
-    int y_size   = s->coded_width * s->coded_height;
-    int uv_size  = y_size / 2;
-    int buf_idx  = cap.index;
+    return AVERROR(EAGAIN);
+}
 
-    if (s->cap_num_planes >= 2) {
-        /* Separate Y and UV planes (driver gave us 2 planes) */
-        memcpy(frame->data[0], s->cap_bufs[buf_idx].start[0], y_size);
-        memcpy(frame->data[1], s->cap_bufs[buf_idx].start[1], uv_size);
-    } else {
-        /* Contiguous NV12 (Y immediately followed by UV) */
-        memcpy(frame->data[0], s->cap_bufs[buf_idx].start[0], y_size);
-        memcpy(frame->data[1],
-               (uint8_t *)s->cap_bufs[buf_idx].start[0] + y_size,
-               uv_size);
+static void stop_threads(SpacemiTMPPDecContext *s)
+{
+    if (s->send_thread_running) {
+        atomic_store_explicit(&s->send_thread_stop, 1, memory_order_release);
+        pthread_join(s->send_thread, NULL);
+        s->send_thread_running = 0;
     }
+    if (s->recv_thread_running) {
+        atomic_store_explicit(&s->recv_thread_stop, 1, memory_order_release);
+        pthread_join(s->recv_thread, NULL);
+        s->recv_thread_running = 0;
+    }
+}
 
-    /* Restore PTS */
-    frame->pts = s->pts_queue[buf_idx % (int)FF_ARRAY_ELEMS(s->pts_queue)];
+static void drain_queues(SpacemiTMPPDecContext *s)
+{
+    /* Drain send ring */
+    int tail = atomic_load_explicit(&s->send_tail, memory_order_relaxed);
+    int head = atomic_load_explicit(&s->send_head, memory_order_relaxed);
+    while (tail != head) {
+        av_free(s->send_data[tail]);
+        tail = (tail + 1) % SEND_RING_SIZE;
+    }
+    atomic_store(&s->send_head, 0);
+    atomic_store(&s->send_tail, 0);
+    atomic_store(&s->send_eos, 0);
 
-    /* Re-queue the CAPTURE buffer */
-    if (xioctl(s->fd, VIDIOC_QBUF, &cap) < 0)
-        av_log(avctx, AV_LOG_WARNING,
-               "spacemit_mpp dec: QBUF CAPTURE %u failed: %s\n",
-               cap.index, strerror(errno));
+    /* Drain frame ring */
+    tail = atomic_load_explicit(&s->frame_tail, memory_order_relaxed);
+    head = atomic_load_explicit(&s->frame_head, memory_order_relaxed);
+    while (tail != head) {
+        DecodedFrame *df = &s->frame_ring[tail];
+        av_free(df->y_data);
+        av_free(df->uv_data);
+        df->y_data = NULL;
+        df->uv_data = NULL;
+        tail = (tail + 1) % FRAME_RING_SIZE;
+    }
+    atomic_store(&s->frame_head, 0);
+    atomic_store(&s->frame_tail, 0);
+}
 
+static void spacemit_decode_flush(AVCodecContext *avctx)
+{
+    SpacemiTMPPDecContext *s = avctx->priv_data;
+
+    stop_threads(s);
+    drain_queues(s);
+
+    if (s->mpp_ctx) VDEC_Flush(s->mpp_ctx);
+    s->draining = 0;
+    atomic_store(&s->eos_received, 0);
+    if (s->bsf) av_bsf_flush(s->bsf);
+
+    /* Restart threads */
+    atomic_store(&s->send_thread_stop, 0);
+    atomic_store(&s->recv_thread_stop, 0);
+    if (pthread_create(&s->recv_thread, NULL, recv_thread_func, s) == 0)
+        s->recv_thread_running = 1;
+    if (pthread_create(&s->send_thread, NULL, send_thread_func, s) == 0)
+        s->send_thread_running = 1;
+}
+
+static int spacemit_decode_close(AVCodecContext *avctx)
+{
+    SpacemiTMPPDecContext *s = avctx->priv_data;
+
+    stop_threads(s);
+    drain_queues(s);
+
+    if (s->mpp_frame) { FRAME_Destory(s->mpp_frame); s->mpp_frame = NULL; }
+    if (s->mpp_pkt)   { PACKET_Destory(s->mpp_pkt);  s->mpp_pkt = NULL; }
+    if (s->mpp_ctx)   { VDEC_DestoryChannel(s->mpp_ctx); s->mpp_ctx = NULL; }
+
+    if (s->bsf) av_bsf_free(&s->bsf);
     return 0;
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * Flush — drain without destroying the decoder state
- * ═══════════════════════════════════════════════════════════════════════════ */
-
-static void spacemit_mpp_decode_flush(AVCodecContext *avctx)
-{
-    SpacemitMppDecContext *s = avctx->priv_data;
-    __u32 t;
-    t = OUT_TYPE; xioctl(s->fd, VIDIOC_STREAMOFF, &t);
-    t = CAP_TYPE; xioctl(s->fd, VIDIOC_STREAMOFF, &t);
-    s->output_started  = 0;
-    s->capture_started = 0;
-    s->draining        = 0;
-    s->eof             = 0;
-    /* Re-queue all capture buffers */
-    queue_all_capture_bufs(avctx);
-    stream_on(avctx, CAP_TYPE);
-    s->capture_started = 1;
+#define DEFINE_SPACEMIT_DECODER(SHORT, AVID)                                    \
+static const AVClass spacemit_mpp_##SHORT##_dec_class = {                       \
+    .class_name = #SHORT "_spacemit_mpp_decoder",                               \
+    .item_name  = av_default_item_name,                                         \
+    .version    = LIBAVUTIL_VERSION_INT,                                        \
+};                                                                              \
+const FFCodec ff_##SHORT##_spacemit_mpp_decoder = {                             \
+    .p.name         = #SHORT "_spacemit_mpp",                                   \
+    .p.long_name    = NULL_IF_CONFIG_SMALL("SpacemiT K1 MPP " #SHORT),         \
+    .p.type         = AVMEDIA_TYPE_VIDEO,                                       \
+    .p.id           = AVID,                                                     \
+    .p.capabilities = AV_CODEC_CAP_DELAY,                                      \
+    .priv_data_size = sizeof(SpacemiTMPPDecContext),                            \
+    .p.priv_class   = &spacemit_mpp_##SHORT##_dec_class,                        \
+    .init           = spacemit_decode_init,                                     \
+    FF_CODEC_RECEIVE_FRAME_CB(spacemit_decode_receive_frame),                   \
+    .flush          = spacemit_decode_flush,                                    \
+    .close          = spacemit_decode_close,                                    \
+    .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,                                \
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * Close
- * ═══════════════════════════════════════════════════════════════════════════ */
-
-static av_cold int spacemit_mpp_decode_close(AVCodecContext *avctx)
-{
-    SpacemitMppDecContext *s = avctx->priv_data;
-    stream_off_dec(s);
-    free_dec_buffers(s->out_bufs, s->n_out); s->out_bufs = NULL;
-    free_dec_buffers(s->cap_bufs, s->n_cap); s->cap_bufs = NULL;
-    if (s->fd >= 0) { close(s->fd); s->fd = -1; }
-    return 0;
-}
-
-/* ═══════════════════════════════════════════════════════════════════════════
- * Options, pixel formats, FFCodec registration
- * ═══════════════════════════════════════════════════════════════════════════ */
-
-static const AVOption spacemit_mpp_dec_options[] = {
-    { "device",
-      "V4L2 device node (empty = auto-detect)",
-      offsetof(SpacemitMppDecContext, device),
-      AV_OPT_TYPE_STRING, { .str = "" }, 0, 0,
-      AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_DECODING_PARAM },
-    { "num_output_bufs",
-      "number of V4L2 OUTPUT (bitstream) queue buffers",
-      offsetof(SpacemitMppDecContext, num_out_bufs),
-      AV_OPT_TYPE_INT, { .i64 = SPACEMIT_DEC_OUTPUT_BUFS }, 2, 32,
-      AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_DECODING_PARAM },
-    { "num_capture_bufs",
-      "number of V4L2 CAPTURE (frame) queue buffers",
-      offsetof(SpacemitMppDecContext, num_cap_bufs),
-      AV_OPT_TYPE_INT, { .i64 = SPACEMIT_DEC_CAPTURE_BUFS }, 2, 32,
-      AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_DECODING_PARAM },
-    { NULL }
-};
-
-#define DEFINE_SPACEMIT_MPP_DECODER(SHORT, FULLNAME, AVID)                    \
-static const AVClass spacemit_mpp_dec_##SHORT##_class = {                     \
-    .class_name = #SHORT "_spacemit_mpp",                                     \
-    .item_name  = av_default_item_name,                                       \
-    .option     = spacemit_mpp_dec_options,                                   \
-    .version    = LIBAVUTIL_VERSION_INT,                                      \
-};                                                                             \
-const FFCodec ff_##SHORT##_spacemit_mpp_decoder = {                           \
-    .p.name         = #SHORT "_spacemit_mpp",                                 \
-    CODEC_LONG_NAME(FULLNAME " (SpacemiT K1 MPP, V4L2 M2M)"),                \
-    .p.type         = AVMEDIA_TYPE_VIDEO,                                     \
-    .p.id           = AVID,                                                   \
-    .priv_data_size = sizeof(SpacemitMppDecContext),                          \
-    .p.priv_class   = &spacemit_mpp_dec_##SHORT##_class,                     \
-    .init           = spacemit_mpp_decode_init,                               \
-    FF_CODEC_RECEIVE_FRAME_CB(spacemit_mpp_receive_frame),                    \
-    .flush          = spacemit_mpp_decode_flush,                              \
-    .close          = spacemit_mpp_decode_close,                              \
-    .p.capabilities = AV_CODEC_CAP_HARDWARE | AV_CODEC_CAP_DR1               \
-                    | AV_CODEC_CAP_AVOID_PROBING,                             \
-    .p.wrapper_name = "spacemit_mpp",                                         \
-    .caps_internal  = FF_CODEC_CAP_NOT_INIT_THREADSAFE,                      \
-};
-
-DEFINE_SPACEMIT_MPP_DECODER(h264, "H.264 / AVC",  AV_CODEC_ID_H264)
-DEFINE_SPACEMIT_MPP_DECODER(hevc, "H.265 / HEVC", AV_CODEC_ID_HEVC)
-DEFINE_SPACEMIT_MPP_DECODER(vp8,  "VP8",           AV_CODEC_ID_VP8)
-DEFINE_SPACEMIT_MPP_DECODER(vp9,  "VP9",           AV_CODEC_ID_VP9)
+DEFINE_SPACEMIT_DECODER(h264,  AV_CODEC_ID_H264);
+DEFINE_SPACEMIT_DECODER(hevc,  AV_CODEC_ID_HEVC);
+DEFINE_SPACEMIT_DECODER(vp8,   AV_CODEC_ID_VP8);
+DEFINE_SPACEMIT_DECODER(mpeg2, AV_CODEC_ID_MPEG2VIDEO);
+DEFINE_SPACEMIT_DECODER(mpeg4, AV_CODEC_ID_MPEG4);

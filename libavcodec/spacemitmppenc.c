@@ -110,6 +110,7 @@ typedef struct SpacemitMppContext {
     int64_t       pts_queue[SPACEMIT_MPP_OUTPUT_BUFS * 2];
     int           pts_head;
     int           pts_tail;
+    int64_t       last_emitted_pts;     /* monotonic PTS for synthesis fallback */
 
     /* ── V2D zero-copy: DMA-buf fds exported from OUTPUT buffers ── */
     int               out_dma_fds[SPACEMIT_MPP_OUTPUT_BUFS][SPACEMIT_MPP_MAX_PLANES];
@@ -125,6 +126,8 @@ typedef struct SpacemitMppContext {
     int           bitrate;
     int           gop_size;
     int           max_b_frames;
+    char         *profile;
+    char         *level;
 } SpacemitMppContext;
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -145,6 +148,7 @@ static __u32 avcodec_to_v4l2_codec(enum AVCodecID id)
     case AV_CODEC_ID_HEVC:  return V4L2_PIX_FMT_HEVC;
     case AV_CODEC_ID_VP8:   return V4L2_PIX_FMT_VP8;
     case AV_CODEC_ID_VP9:   return V4L2_PIX_FMT_VP9;
+    case AV_CODEC_ID_MJPEG: return V4L2_PIX_FMT_JPEG;
     default:                return 0;
     }
 }
@@ -576,6 +580,7 @@ static void copy_nv12_to_planes(V4L2Buf *buf,
 static av_cold int spacemit_mpp_encode_init(AVCodecContext *avctx)
 {
     SpacemitMppContext *s = avctx->priv_data;
+    s->last_emitted_pts = -1;
     int ret;
 
     s->fd = -1;
@@ -814,8 +819,28 @@ static int spacemit_mpp_receive_packet(AVCodecContext *avctx, AVPacket *pkt)
     if (ret < 0) goto requeue;
 
     memcpy(pkt->data, s->cap_bufs[cap_buf.index].start[0], pkt_size);
-    pkt->pts = pts_pop(s);
+
+    /* PTS recovery, in priority order:
+     * 1. V4L2 driver propagated the input timestamp to the output buffer.
+     * 2. The pts FIFO populated on QBUF.
+     * 3. Synthesised: last_emitted_pts + 1 - guarantees monotonicity for
+     *    HLS/fmp4 muxers. Covers the V4L2 stateful encoder's initial
+     *    header packet (VPS/SPS/PPS) which has no input frame association. */
+    int64_t v4l2_pts = (int64_t)cap_buf.timestamp.tv_sec * 1000000
+                     + (int64_t)cap_buf.timestamp.tv_usec;
+    int64_t queued = pts_pop(s);
+    if (cap_buf.timestamp.tv_sec != 0 || cap_buf.timestamp.tv_usec != 0) {
+        pkt->pts = v4l2_pts;
+    } else if (queued != AV_NOPTS_VALUE) {
+        pkt->pts = queued;
+    } else {
+        pkt->pts = s->last_emitted_pts + 1;
+    }
+    if (pkt->pts <= s->last_emitted_pts)
+        pkt->pts = s->last_emitted_pts + 1;
+    s->last_emitted_pts = pkt->pts;
     pkt->dts = pkt->pts;
+
     if (cap_buf.flags & V4L2_BUF_FLAG_KEYFRAME)
         pkt->flags |= AV_PKT_FLAG_KEY;
 
@@ -883,6 +908,16 @@ static const AVOption spacemit_mpp_options[] = {
       offsetof(SpacemitMppContext, num_cap_bufs),
       AV_OPT_TYPE_INT, { .i64 = SPACEMIT_MPP_CAPTURE_BUFS }, 2, 16,
       AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_ENCODING_PARAM },
+    { "profile",
+      "Set the encoding profile (accepted but ignored)",
+      offsetof(SpacemitMppContext, profile),
+      AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0,
+      AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_ENCODING_PARAM },
+    { "level",
+      "Set the encoding level (accepted but ignored)",
+      offsetof(SpacemitMppContext, level),
+      AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0,
+      AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_ENCODING_PARAM },
     { NULL }
 };
 
@@ -929,7 +964,8 @@ const FFCodec ff_##SHORT##_spacemit_mpp_encoder = {                          \
     .caps_internal  = FF_CODEC_CAP_NOT_INIT_THREADSAFE,                     \
 };
 
-DEFINE_SPACEMIT_MPP_ENCODER(h264, "H.264 / AVC",  AV_CODEC_ID_H264)
-DEFINE_SPACEMIT_MPP_ENCODER(hevc, "H.265 / HEVC", AV_CODEC_ID_HEVC)
-DEFINE_SPACEMIT_MPP_ENCODER(vp8,  "VP8",           AV_CODEC_ID_VP8)
-DEFINE_SPACEMIT_MPP_ENCODER(vp9,  "VP9",           AV_CODEC_ID_VP9)
+DEFINE_SPACEMIT_MPP_ENCODER(h264,  "H.264 / AVC",  AV_CODEC_ID_H264)
+DEFINE_SPACEMIT_MPP_ENCODER(hevc,  "H.265 / HEVC", AV_CODEC_ID_HEVC)
+DEFINE_SPACEMIT_MPP_ENCODER(vp8,   "VP8",          AV_CODEC_ID_VP8)
+DEFINE_SPACEMIT_MPP_ENCODER(vp9,   "VP9",          AV_CODEC_ID_VP9)
+DEFINE_SPACEMIT_MPP_ENCODER(mjpeg, "MJPEG",        AV_CODEC_ID_MJPEG)

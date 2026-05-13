@@ -50,8 +50,8 @@ all: all-yes
 include $(SRC_PATH)/tools/Makefile
 include $(SRC_PATH)/ffbuild/common.mak
 
-FF_EXTRALIBS := $(FFEXTRALIBS)
-FF_DEP_LIBS  := $(DEP_LIBS)
+FF_EXTRALIBS := $(FFEXTRALIBS) -lspacemit_mpp
+FF_DEP_LIBS  := $(DEP_LIBS) 
 FF_STATIC_DEP_LIBS := $(STATIC_DEP_LIBS)
 
 $(TOOLS): %$(EXESUF): %.o

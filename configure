@@ -3612,17 +3612,19 @@ h264_v4l2m2m_encoder_deps="v4l2_m2m h264_v4l2_m2m"
 # --enable-spacemit_mpp enables the feature and auto-selects all supported codecs.
 # Individual codecs can still be disabled with --disable-encoder=h264_spacemit_mpp etc.
 spacemit_mpp_deps="linux_videodev2_h"
-spacemit_mpp_select="h264_spacemit_mpp_encoder hevc_spacemit_mpp_encoder vp8_spacemit_mpp_encoder vp9_spacemit_mpp_encoder h264_spacemit_mpp_decoder hevc_spacemit_mpp_decoder vp8_spacemit_mpp_decoder vp9_spacemit_mpp_decoder"
+spacemit_mpp_select="h264_spacemit_mpp_encoder hevc_spacemit_mpp_encoder vp8_spacemit_mpp_encoder vp9_spacemit_mpp_encoder h264_spacemit_mpp_decoder hevc_spacemit_mpp_decoder vp8_spacemit_mpp_decoder mpeg2_spacemit_mpp_decoder mpeg4_spacemit_mpp_decoder mjpeg_spacemit_mpp_encoder"
 
 h264_spacemit_mpp_encoder_deps="linux_videodev2_h"
 hevc_spacemit_mpp_encoder_deps="linux_videodev2_h"
 vp8_spacemit_mpp_encoder_deps="linux_videodev2_h"
 vp9_spacemit_mpp_encoder_deps="linux_videodev2_h"
+mjpeg_spacemit_mpp_encoder_deps="linux_videodev2_h"
 
 h264_spacemit_mpp_decoder_deps="linux_videodev2_h"
 hevc_spacemit_mpp_decoder_deps="linux_videodev2_h"
 vp8_spacemit_mpp_decoder_deps="linux_videodev2_h"
-vp9_spacemit_mpp_decoder_deps="linux_videodev2_h"
+mpeg2_spacemit_mpp_decoder_deps="linux_videodev2_h"
+mpeg4_spacemit_mpp_decoder_deps="linux_videodev2_h"
 
 hevc_amf_encoder_deps="amf"
 hevc_amf_decoder_deps="amf"
@@ -7494,7 +7496,6 @@ enabled ohcodec           && { check_lib ohcodec "multimedia/player_framework/na
                                     -lnative_media_vdec -lnative_media_venc -lnative_media_codecbase -lnative_media_core -lnative_window ||
                                die "ERROR: missing native_media libs"; }
 # SpacemiT K1 V2D 2D blitter: check header + library, enable if found
-if enabled spacemit_mpp; then
     if check_headers "spacemit/v2d_api.h" &&
        check_func_headers "spacemit/v2d_compat.h spacemit/v2d_api.h" V2D_BeginJob -lv2d; then
         enable spacemit_v2d
@@ -7502,7 +7503,6 @@ if enabled spacemit_mpp; then
     else
         warn "V2D library not found; SpacemiT V2D acceleration disabled"
     fi
-fi
 enabled openal            && { check_pkg_config openal "openal >= 1.1" "AL/al.h" alGetError ||
                                { for al_extralibs in "${OPENAL_LIBS}" "-lopenal" "-lOpenAL32"; do
                                check_lib openal 'AL/al.h' alGetError "${al_extralibs}" && break; done } ||
