@@ -455,7 +455,19 @@ int ff_v4l2_buffer_buf_to_avframe(AVFrame *frame, V4L2Buffer *avbuf)
     frame->colorspace = v4l2_get_color_space(avbuf);
     frame->color_range = v4l2_get_color_range(avbuf);
     frame->color_trc = v4l2_get_color_trc(avbuf);
-    frame->pts = v4l2_get_pts(avbuf);
+    /* Monotonic PTS recovery: the V4L2 driver propagates input buf.timestamp
+     * to output buf, but if the input packet had AV_NOPTS_VALUE its timestamp
+     * was set to 0 by v4l2_set_pts.  Detect resulting non-monotonic PTS and
+     * synthesise sequential values so downstream filters/muxers don't reject
+     * frames with duplicate/zero DTS. */
+    {
+        V4L2m2mContext *m2m_ctx = buf_to_m2mctx(avbuf);
+        int64_t pts = v4l2_get_pts(avbuf);
+        if (m2m_ctx->last_dec_pts != AV_NOPTS_VALUE && pts <= m2m_ctx->last_dec_pts)
+            pts = m2m_ctx->last_dec_pts + 1;
+        m2m_ctx->last_dec_pts = pts;
+        frame->pts = pts;
+    }
     frame->pkt_dts = AV_NOPTS_VALUE;
     v4l2_get_interlacing(frame, avbuf);
 
@@ -493,7 +505,14 @@ int ff_v4l2_buffer_buf_to_avpkt(AVPacket *pkt, V4L2Buffer *avbuf)
         pkt->flags |= AV_PKT_FLAG_CORRUPT;
     }
 
-    pkt->dts = pkt->pts = v4l2_get_pts(avbuf);
+    {
+        V4L2m2mContext *m2m_ctx = buf_to_m2mctx(avbuf);
+        int64_t pts = v4l2_get_pts(avbuf);
+        if (m2m_ctx->last_enc_pts != AV_NOPTS_VALUE && pts <= m2m_ctx->last_enc_pts)
+            pts = m2m_ctx->last_enc_pts + 1;
+        m2m_ctx->last_enc_pts = pts;
+        pkt->dts = pkt->pts = pts;
+    }
 
     return 0;
 }

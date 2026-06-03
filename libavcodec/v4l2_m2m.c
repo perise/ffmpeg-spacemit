@@ -72,6 +72,8 @@ static int v4l2_prepare_contexts(V4L2m2mContext *s, int probe)
     s->output.name = "output";
     atomic_init(&s->refcount, 0);
     sem_init(&s->refsync, 0, 0);
+    s->last_dec_pts = AV_NOPTS_VALUE;
+    s->last_enc_pts = AV_NOPTS_VALUE;
 
     memset(&cap, 0, sizeof(cap));
     ret = ioctl(s->fd, VIDIOC_QUERYCAP, &cap);

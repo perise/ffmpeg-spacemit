@@ -66,6 +66,15 @@ typedef struct V4L2m2mContext {
 
     /* reference back to V4L2m2mPriv */
     void *priv;
+
+    /* PTS recovery for drivers that don't propagate input->output timestamps
+     * (or when input packets carry AV_NOPTS_VALUE).  Tracks the last PTS
+     * emitted on the decoder output / encoder output path; if the V4L2
+     * timestamp comes back as 0 or non-monotonic, the value is synthesised
+     * to last_emitted_pts + 1 so downstream filters/muxers don't reject
+     * frames with duplicate/zero DTS. */
+    int64_t last_dec_pts;
+    int64_t last_enc_pts;
 } V4L2m2mContext;
 
 typedef struct V4L2m2mPriv {

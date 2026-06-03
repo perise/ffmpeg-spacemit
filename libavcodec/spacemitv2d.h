@@ -22,6 +22,7 @@
 #define AVCODEC_SPACEMITV2D_H
 
 #include <stdint.h>
+#include "config.h"
 #include "libavutil/log.h"
 
 /* DMA-buf fd set attached to an AVFrame produced by the zero-copy decoder.
@@ -47,6 +48,8 @@ typedef struct SpacemitV2DCtx {
     int    available;        /* 1 if V2D device was opened successfully */
     /* internal — V2D device fd is managed inside spacemitv2d.c */
 } SpacemitV2DCtx;
+
+#if CONFIG_SPACEMIT_V2D
 
 /* Open /dev/v2d_dev.  Returns 0 on success. */
 int  spacemit_v2d_init(SpacemitV2DCtx *ctx, void *av_log_ctx);
@@ -75,5 +78,28 @@ int spacemit_v2d_blit(SpacemitV2DCtx       *ctx,
                       int                   dst_w,
                       int                   dst_h,
                       int                   dst_stride);
+
+#else  /* !CONFIG_SPACEMIT_V2D — V2D hardware blitter not available on this build */
+
+static inline int spacemit_v2d_init(SpacemitV2DCtx *ctx, void *av_log_ctx)
+{
+    (void)av_log_ctx;
+    if (ctx) ctx->available = 0;
+    return -1;
+}
+
+static inline void spacemit_v2d_close(SpacemitV2DCtx *ctx) { (void)ctx; }
+
+static inline int spacemit_v2d_blit(SpacemitV2DCtx *ctx,
+                                    const SpacemitDMAFrameInfo *src_info,
+                                    const int *dst_fds, int dst_nplanes,
+                                    int dst_w, int dst_h, int dst_stride)
+{
+    (void)ctx; (void)src_info; (void)dst_fds; (void)dst_nplanes;
+    (void)dst_w; (void)dst_h; (void)dst_stride;
+    return -1;   /* signal "not available", encoder falls back to CPU copy */
+}
+
+#endif /* CONFIG_SPACEMIT_V2D */
 
 #endif /* AVCODEC_SPACEMITV2D_H */
