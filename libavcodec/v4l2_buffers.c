@@ -459,12 +459,21 @@ int ff_v4l2_buffer_buf_to_avframe(AVFrame *frame, V4L2Buffer *avbuf)
      * to output buf, but if the input packet had AV_NOPTS_VALUE its timestamp
      * was set to 0 by v4l2_set_pts.  Detect resulting non-monotonic PTS and
      * synthesise sequential values so downstream filters/muxers don't reject
-     * frames with duplicate/zero DTS. */
+     * frames with duplicate/zero DTS.  Increment is one frame duration in
+     * the consumer timebase, derived from avctx->framerate when known so
+     * downstream rate-limiters (-t, vsync) see realistic timestamps. */
     {
         V4L2m2mContext *m2m_ctx = buf_to_m2mctx(avbuf);
         int64_t pts = v4l2_get_pts(avbuf);
-        if (m2m_ctx->last_dec_pts != AV_NOPTS_VALUE && pts <= m2m_ctx->last_dec_pts)
-            pts = m2m_ctx->last_dec_pts + 1;
+        if (m2m_ctx->last_dec_pts != AV_NOPTS_VALUE && pts <= m2m_ctx->last_dec_pts) {
+            AVRational fr = m2m_ctx->avctx->framerate;
+            AVRational tb = v4l2_get_timebase(avbuf);
+            int64_t inc = 1;
+            if (fr.num > 0 && fr.den > 0)
+                inc = av_rescale_q(1, (AVRational){fr.den, fr.num}, tb);
+            if (inc < 1) inc = 1;
+            pts = m2m_ctx->last_dec_pts + inc;
+        }
         m2m_ctx->last_dec_pts = pts;
         frame->pts = pts;
     }
@@ -508,8 +517,15 @@ int ff_v4l2_buffer_buf_to_avpkt(AVPacket *pkt, V4L2Buffer *avbuf)
     {
         V4L2m2mContext *m2m_ctx = buf_to_m2mctx(avbuf);
         int64_t pts = v4l2_get_pts(avbuf);
-        if (m2m_ctx->last_enc_pts != AV_NOPTS_VALUE && pts <= m2m_ctx->last_enc_pts)
-            pts = m2m_ctx->last_enc_pts + 1;
+        if (m2m_ctx->last_enc_pts != AV_NOPTS_VALUE && pts <= m2m_ctx->last_enc_pts) {
+            AVRational fr = m2m_ctx->avctx->framerate;
+            AVRational tb = v4l2_get_timebase(avbuf);
+            int64_t inc = 1;
+            if (fr.num > 0 && fr.den > 0)
+                inc = av_rescale_q(1, (AVRational){fr.den, fr.num}, tb);
+            if (inc < 1) inc = 1;
+            pts = m2m_ctx->last_enc_pts + inc;
+        }
         m2m_ctx->last_enc_pts = pts;
         pkt->dts = pkt->pts = pts;
     }
