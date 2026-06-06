@@ -468,24 +468,29 @@ static inline int v4l2_try_raw_format(V4L2Context* ctx, enum AVPixelFormat pixfm
 {
     struct v4l2_format *fmt = &ctx->format;
     uint32_t v4l2_fmt;
-    int ret;
+    int idx = -1;
+    int multiplanar = V4L2_TYPE_IS_MULTIPLANAR(ctx->type);
+    int last_err = AVERROR(EINVAL);
 
-    v4l2_fmt = ff_v4l2_format_avfmt_to_v4l2(pixfmt);
-    if (!v4l2_fmt)
-        return AVERROR(EINVAL);
+    /* fmt_map sometimes lists more than one V4L2 fourcc per AV pixel
+     * format -- e.g. YUV420P maps to V4L2_PIX_FMT_YUV420 (single-planar)
+     * AND V4L2_PIX_FMT_YUV420M (multi-planar).  The original code only
+     * tried the first one, which excluded any driver that exposes only
+     * the multi-planar variant (the SpacemiT mvx encoder behaves that
+     * way: it lists YM12 but not YUV420).  Walk every matching V4L2
+     * fourcc and accept the first one the driver agrees to. */
+    while ((v4l2_fmt = ff_v4l2_format_avfmt_to_v4l2_next(pixfmt, &idx)) != 0) {
+        if (multiplanar)
+            fmt->fmt.pix_mp.pixelformat = v4l2_fmt;
+        else
+            fmt->fmt.pix.pixelformat = v4l2_fmt;
+        fmt->type = ctx->type;
 
-    if (V4L2_TYPE_IS_MULTIPLANAR(ctx->type))
-        fmt->fmt.pix_mp.pixelformat = v4l2_fmt;
-    else
-        fmt->fmt.pix.pixelformat = v4l2_fmt;
-
-    fmt->type = ctx->type;
-
-    ret = ioctl(ctx_to_m2mctx(ctx)->fd, VIDIOC_TRY_FMT, fmt);
-    if (ret)
-        return AVERROR(EINVAL);
-
-    return 0;
+        if (ioctl(ctx_to_m2mctx(ctx)->fd, VIDIOC_TRY_FMT, fmt) == 0)
+            return 0;
+        last_err = AVERROR(EINVAL);
+    }
+    return last_err;
 }
 
 static int v4l2_get_raw_format(V4L2Context* ctx, enum AVPixelFormat *p)

@@ -141,9 +141,12 @@ typedef struct ScaleSpacemitContext {
     DMABuf dst_dma;       /* NV12 output, out_w × out_h    */
     int    src_w, src_h;  /* current src_dma frame size     */
 
-    /* libswscale context — used both for YUV420P→NV12 pre-conversion
-     * and as the full CPU fallback path */
+    /* libswscale context — used as the full CPU fallback path */
     struct SwsContext *sws;
+
+    /* Chosen output pixel format (NV12 or YUV420P), picked by
+     * filter-graph negotiation in scale_spacemit_config_output. */
+    enum AVPixelFormat out_format;
 } ScaleSpacemitContext;
 
 /* ── V2D scale via NV12-native BlendTask ───────────────────────────────── */
@@ -272,6 +275,102 @@ static void dma_to_frame_nv12(const uint8_t *dma, AVFrame *f, int w, int h)
     }
 }
 
+/* ── Stride-aware YUV420P frame ↔ contiguous DMA buffer ──────────────────── */
+
+static void frame_to_dma_yuv420p(const AVFrame *f, uint8_t *dma, int w, int h)
+{
+    const uint8_t *src;
+    uint8_t       *dst;
+    int            cw = w / 2, ch = h / 2;
+
+    /* Y plane */
+    src = f->data[0];
+    dst = dma;
+    for (int y = 0; y < h; y++) { memcpy(dst, src, w); src += f->linesize[0]; dst += w; }
+    /* U plane */
+    src = f->data[1];
+    dst = dma + (size_t)w * h;
+    for (int y = 0; y < ch; y++) { memcpy(dst, src, cw); src += f->linesize[1]; dst += cw; }
+    /* V plane */
+    src = f->data[2];
+    dst = dma + (size_t)w * h + (size_t)cw * ch;
+    for (int y = 0; y < ch; y++) { memcpy(dst, src, cw); src += f->linesize[2]; dst += cw; }
+}
+
+static void dma_to_frame_yuv420p(const uint8_t *dma, AVFrame *f, int w, int h)
+{
+    const uint8_t *src;
+    uint8_t       *dst;
+    int            cw = w / 2, ch = h / 2;
+
+    src = dma;                 dst = f->data[0];
+    for (int y = 0; y < h;  y++) { memcpy(dst, src, w);  src += w;  dst += f->linesize[0]; }
+    src = dma + (size_t)w * h; dst = f->data[1];
+    for (int y = 0; y < ch; y++) { memcpy(dst, src, cw); src += cw; dst += f->linesize[1]; }
+    src = dma + (size_t)w * h + (size_t)cw * ch; dst = f->data[2];
+    for (int y = 0; y < ch; y++) { memcpy(dst, src, cw); src += cw; dst += f->linesize[2]; }
+}
+
+/* ── V2D scale via three Y8 bit-blits (Y, U, V) — YUV420P-native ─────────
+ *
+ * The V2D library has no YUV420P color format constant, but YUV420P is just
+ * three independent Y8 (single-byte-per-pixel) planes: Y is w×h, U and V
+ * are each w/2 × h/2.  V2D_AddBitblitTask applies bilinear scaling per
+ * surface, so three Y8 bit-blits give us a full YUV420P scale with the
+ * pipeline staying in YUV420P throughout — no NV12 conversion anywhere.
+ */
+static int v2d_blit_y8(V2D_HANDLE job,
+                       int src_fd, uint32_t src_off, int sw, int sh,
+                       int dst_fd, uint32_t dst_off, int dw, int dh)
+{
+    V2D_SURFACE_S s = {0}, d = {0};
+    V2D_AREA_S    sa = {0}, da = {0};
+
+    s.fd     = src_fd; s.offset = src_off;
+    s.w      = (uint16_t)sw; s.h = (uint16_t)sh; s.stride = (uint16_t)sw;
+    s.format = V2D_COLOR_FORMAT_Y8;
+    d.fd     = dst_fd; d.offset = dst_off;
+    d.w      = (uint16_t)dw; d.h = (uint16_t)dh; d.stride = (uint16_t)dw;
+    d.format = V2D_COLOR_FORMAT_Y8;
+    sa.w = (uint16_t)sw; sa.h = (uint16_t)sh;
+    da.w = (uint16_t)dw; da.h = (uint16_t)dh;
+
+    return V2D_AddBitblitTask(job, &d, &da, &s, &sa, V2D_CSC_MODE_BUTT);
+}
+
+static int v2d_scale_yuv420p(AVFilterContext *avctx,
+                              int src_fd, int sw, int sh,
+                              int dst_fd, int dw, int dh)
+{
+    int scw = sw / 2, sch = sh / 2;
+    int dcw = dw / 2, dch = dh / 2;
+    uint32_t s_u_off = (uint32_t)sw * sh;
+    uint32_t s_v_off = s_u_off + (uint32_t)scw * sch;
+    uint32_t d_u_off = (uint32_t)dw * dh;
+    uint32_t d_v_off = d_u_off + (uint32_t)dcw * dch;
+
+    V2D_HANDLE job;
+    if (V2D_BeginJob(&job) != SUCCESS) {
+        av_log(avctx, AV_LOG_WARNING,
+               "scale_spacemit: V2D_BeginJob failed (yuv420p)\n");
+        return AVERROR_EXTERNAL;
+    }
+    if (v2d_blit_y8(job, src_fd, 0,        sw,  sh,  dst_fd, 0,        dw,  dh) != SUCCESS ||
+        v2d_blit_y8(job, src_fd, s_u_off,  scw, sch, dst_fd, d_u_off,  dcw, dch) != SUCCESS ||
+        v2d_blit_y8(job, src_fd, s_v_off,  scw, sch, dst_fd, d_v_off,  dcw, dch) != SUCCESS) {
+        V2D_EndJob(job);
+        av_log(avctx, AV_LOG_WARNING,
+               "scale_spacemit: V2D_AddBitblitTask failed (yuv420p)\n");
+        return AVERROR_EXTERNAL;
+    }
+    if (V2D_EndJob(job) != SUCCESS) {
+        av_log(avctx, AV_LOG_WARNING,
+               "scale_spacemit: V2D_EndJob failed (yuv420p)\n");
+        return AVERROR_EXTERNAL;
+    }
+    return 0;
+}
+
 /* ── AVFilter callbacks ────────────────────────────────────────────────── */
 
 static av_cold int scale_spacemit_init(AVFilterContext *avctx)
@@ -314,9 +413,11 @@ static int scale_spacemit_query_formats(const AVFilterContext *ctx,
     static const enum AVPixelFormat in_fmts[] = {
         AV_PIX_FMT_NV12, AV_PIX_FMT_YUV420P, AV_PIX_FMT_NONE
     };
-    /* Output: always NV12 (native V2D format, minimal overhead) */
+    /* Output: NV12 (single V2D NV12-native blit) or YUV420P (three Y8
+     * blits, no NV12 conversion anywhere).  Filter-graph negotiation
+     * picks whichever the downstream prefers. */
     static const enum AVPixelFormat out_fmts[] = {
-        AV_PIX_FMT_NV12, AV_PIX_FMT_NONE
+        AV_PIX_FMT_NV12, AV_PIX_FMT_YUV420P, AV_PIX_FMT_NONE
     };
 
     int ret;
@@ -353,7 +454,11 @@ static int scale_spacemit_config_output(AVFilterLink *outlink)
 
     outlink->w      = s->out_w;
     outlink->h      = s->out_h;
-    outlink->format = AV_PIX_FMT_NV12;
+    /* Filter graph negotiation has already chosen outlink->format from
+     * the candidates we advertised; default to NV12 if unset. */
+    if (outlink->format == AV_PIX_FMT_NONE)
+        outlink->format = AV_PIX_FMT_NV12;
+    s->out_format = outlink->format;
 
     /* Propagate SAR, adjusting for the new AR */
     if (inlink->sample_aspect_ratio.num) {
@@ -366,10 +471,11 @@ static int scale_spacemit_config_output(AVFilterLink *outlink)
     }
 
     av_log(avctx, AV_LOG_VERBOSE,
-           "scale_spacemit: %dx%d %s → %dx%d NV12  [%s]\n",
+           "scale_spacemit: %dx%d %s → %dx%d %s  [%s]\n",
            inlink->w, inlink->h,
            av_get_pix_fmt_name(inlink->format),
            s->out_w, s->out_h,
+           av_get_pix_fmt_name(s->out_format),
            s->v2d_ok ? "V2D HW" : "swscale CPU");
 
     /* Pre-allocate destination DMA buffer (size is fixed at output dims) */
@@ -394,9 +500,9 @@ static int scale_spacemit_filter_frame(AVFilterLink *inlink, AVFrame *in)
     AVFrame *out = NULL;
     int ret;
 
-    /* ── Passthrough: same dimensions, already NV12 ── */
+    /* ── Passthrough: same dims AND already the format the downstream wants ── */
     if (in->width == s->out_w && in->height == s->out_h &&
-        in->format == AV_PIX_FMT_NV12) {
+        in->format == s->out_format) {
         return ff_filter_frame(outlink, in);
     }
 
@@ -421,35 +527,28 @@ static int scale_spacemit_filter_frame(AVFilterLink *inlink, AVFrame *in)
             s->src_h = in_h;
         }
 
-        /* Stage input into contiguous NV12 DMA buffer */
-        if (in->format == AV_PIX_FMT_NV12) {
+        /* Stage input into contiguous DMA buffer in whichever layout
+         * V2D will use to scale (matches in->format). */
+        if (in->format == AV_PIX_FMT_NV12)
             frame_to_dma_nv12(in, s->src_dma.ptr, in_w, in_h);
-        } else {
-            /* YUV420P → NV12 conversion directly into DMA src memory */
-            uint8_t *dst_data[4] = {
-                (uint8_t *)s->src_dma.ptr,
-                (uint8_t *)s->src_dma.ptr + (size_t)in_w * in_h,
-                NULL, NULL
-            };
-            int dst_linesize[4] = { in_w, in_w, 0, 0 };
+        else  /* AV_PIX_FMT_YUV420P */
+            frame_to_dma_yuv420p(in, s->src_dma.ptr, in_w, in_h);
 
-            s->sws = sws_getCachedContext(s->sws,
-                in_w, in_h, in->format,
-                in_w, in_h, AV_PIX_FMT_NV12,
-                SWS_BILINEAR, NULL, NULL, NULL);
-            if (!s->sws) {
-                ret = AVERROR(ENOMEM);
-                goto fail;
-            }
-            sws_scale(s->sws,
-                      (const uint8_t * const *)in->data, in->linesize,
-                      0, in_h, dst_data, dst_linesize);
-        }
+        /* Mid-pipeline layout change (NV12 <-> YUV420P) would require
+         * sws-based conversion either before or after V2D.  We do not
+         * support it via V2D — fall back to libswscale. */
+        if (in->format != s->out_format)
+            goto sw_fallback;
 
-        /* V2D scale: src_dma → dst_dma */
-        ret = v2d_scale_nv12(avctx,
-                             s->src_dma.fd, in_w,    in_h,
-                             s->dst_dma.fd, s->out_w, s->out_h);
+        /* V2D scale: src_dma → dst_dma in whichever native layout */
+        if (s->out_format == AV_PIX_FMT_NV12)
+            ret = v2d_scale_nv12(avctx,
+                                 s->src_dma.fd, in_w,    in_h,
+                                 s->dst_dma.fd, s->out_w, s->out_h);
+        else
+            ret = v2d_scale_yuv420p(avctx,
+                                    s->src_dma.fd, in_w,    in_h,
+                                    s->dst_dma.fd, s->out_w, s->out_h);
         if (ret < 0) {
             av_log(avctx, AV_LOG_WARNING,
                    "scale_spacemit: V2D failed — disabling HW for this session\n");
@@ -464,11 +563,14 @@ static int scale_spacemit_filter_frame(AVFilterLink *inlink, AVFrame *in)
         ret = av_frame_copy_props(out, in);
         if (ret < 0) goto fail;
 
-        dma_to_frame_nv12(s->dst_dma.ptr, out, s->out_w, s->out_h);
+        if (s->out_format == AV_PIX_FMT_NV12)
+            dma_to_frame_nv12(s->dst_dma.ptr, out, s->out_w, s->out_h);
+        else
+            dma_to_frame_yuv420p(s->dst_dma.ptr, out, s->out_w, s->out_h);
 
         out->width  = s->out_w;
         out->height = s->out_h;
-        out->format = AV_PIX_FMT_NV12;
+        out->format = s->out_format;
 
         /* Strip size-dependent side data when resolution changed */
         if (in->width != s->out_w || in->height != s->out_h) {
@@ -491,11 +593,11 @@ sw_fallback:
 
     out->width  = s->out_w;
     out->height = s->out_h;
-    out->format = AV_PIX_FMT_NV12;
+    out->format = s->out_format;
 
     s->sws = sws_getCachedContext(s->sws,
         in->width, in->height, in->format,
-        s->out_w,  s->out_h,   AV_PIX_FMT_NV12,
+        s->out_w,  s->out_h,   s->out_format,
         SWS_BILINEAR, NULL, NULL, NULL);
     if (!s->sws) { ret = AVERROR(ENOMEM); goto fail; }
 

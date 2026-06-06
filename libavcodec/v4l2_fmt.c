@@ -129,6 +129,24 @@ uint32_t ff_v4l2_format_avfmt_to_v4l2(enum AVPixelFormat avfmt)
     return 0;
 }
 
+/* Iterate through every V4L2 raw fourcc that maps to a given AV pixel
+ * format.  Returns the next match strictly after *idx (set *idx = -1 on
+ * first call), advancing *idx so the caller can keep iterating.  Returns
+ * 0 when no more matches.  Lets the m2m context-setup code try both the
+ * single-planar (e.g. YUV420) and multi-planar (YUV420M / NV12M) variants
+ * before giving up, instead of always picking the first one in fmt_map. */
+uint32_t ff_v4l2_format_avfmt_to_v4l2_next(enum AVPixelFormat avfmt, int *idx)
+{
+    int i;
+    for (i = *idx + 1; i < FF_ARRAY_ELEMS(fmt_map); i++) {
+        if (fmt_map[i].avfmt == avfmt && fmt_map[i].avcodec == AV_CODEC_ID_RAWVIDEO) {
+            *idx = i;
+            return fmt_map[i].v4l2_fmt;
+        }
+    }
+    return 0;
+}
+
 enum AVPixelFormat ff_v4l2_format_v4l2_to_avfmt(uint32_t v4l2_fmt, enum AVCodecID avcodec)
 {
     int i;
